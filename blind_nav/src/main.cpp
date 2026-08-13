@@ -218,6 +218,11 @@ void camera_thread_func(int camera_index) {
     video_out.close();
 }
 
+// Сигнал "кнопка нажата" процессу voice_nav_daemon.py — сознательно TCP по
+// loopback, а не AF_UNIX: единственное сообщение на нажатие кнопки (частота
+// — секунды, не кадры), выигрыш AF_UNIX в задержке (десятки микросекунд)
+// человеку не заметен. Порт 9999 занят исключительно этой парой процессов,
+// конфликтов быть не должно.
 void send_start_signal() {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) return;

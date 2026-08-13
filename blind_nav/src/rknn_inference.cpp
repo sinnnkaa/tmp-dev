@@ -4,6 +4,7 @@
 #include <vector>
 #include <cstring>
 #include <algorithm>
+#include <chrono>
 
 RKNNModel::RKNNModel() : ctx(0) {}
 
@@ -45,10 +46,17 @@ bool RKNNModel::load(const std::string& model_path) {
     return true;
 }
 
-std::vector<std::vector<float>> RKNNModel::infer(const cv::Mat& img) {
+std::vector<std::vector<float>> RKNNModel::infer(const cv::Mat& img, InferTiming* timing) {
+    using Clock = std::chrono::high_resolution_clock;
+    auto ms_since = [](Clock::time_point from) {
+        return std::chrono::duration<double, std::milli>(Clock::now() - from).count();
+    };
+
+    auto t0 = Clock::now();
     cv::Mat resized, rgb;
     cv::resize(img, resized, cv::Size(512, 512));
     cv::cvtColor(resized, rgb, cv::COLOR_BGR2RGB);
+    if (timing) timing->preprocess_ms = ms_since(t0);
 
     rknn_input inputs[1];
     memset(inputs, 0, sizeof(inputs));
@@ -58,13 +66,17 @@ std::vector<std::vector<float>> RKNNModel::infer(const cv::Mat& img) {
     inputs[0].size = 512 * 512 * 3;
     inputs[0].buf = rgb.data;
 
+    auto t1 = Clock::now();
     int ret = rknn_inputs_set(ctx, 1, inputs);
+    if (timing) timing->input_copy_ms = ms_since(t1);
     if (ret < 0) {
         std::cerr << "rknn_inputs_set error ret=" << ret << std::endl;
         return {};
     }
 
+    auto t2 = Clock::now();
     ret = rknn_run(ctx, nullptr);
+    if (timing) timing->npu_run_ms = ms_since(t2);
     if (ret < 0) {
         std::cerr << "rknn_run error ret=" << ret << std::endl;
         return {};
@@ -76,7 +88,9 @@ std::vector<std::vector<float>> RKNNModel::infer(const cv::Mat& img) {
     outputs[1].want_float = 1;
     outputs[2].want_float = 1;
 
+    auto t3 = Clock::now();
     ret = rknn_outputs_get(ctx, 3, outputs, nullptr);
+    if (timing) timing->dequant_ms = ms_since(t3);
     if (ret < 0) {
         std::cerr << "rknn_outputs_get error ret=" << ret << std::endl;
         return {};

@@ -356,6 +356,9 @@ def main():
             pass
         sys.exit(1)
 
+    # TCP по loopback, а не AF_UNIX — сознательный выбор: единственное
+    # сообщение на нажатие кнопки (main.cpp:send_start_signal), частота
+    # — секунды, не кадры. Разница в задержке с AF_UNIX человеку не заметна.
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(('127.0.0.1', SOCKET_PORT))
