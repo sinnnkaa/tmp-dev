@@ -12,12 +12,13 @@ endif()
 set(CMAKE_CXX_FLAGS_RELEASE "-O2")
 
 # RKNN
-# link_directories(/usr/lib)
-
-set(RKNN_API_PATH /root/diplom/rknn-toolkit2/rknpu2/runtime/Linux/librknn_api/aarch64/librknnrt.so)
+# Рантайм вендорен прямо в репозиторий (third_party/rknn/, см. README там) —
+# раньше путь указывал на /root/diplom/rknn-toolkit2 вне репозитория, из-за
+# чего сборка ломалась на чистом клоне без ручной подготовки платы.
+set(RKNN_API_PATH ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/rknn/lib/aarch64/librknnrt.so)
 
 include_directories(
-    /root/diplom/rknn-toolkit2/rknpu2/runtime/Linux/librknn_api/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/rknn/include
 )
 
 # OpenCV
@@ -47,4 +48,24 @@ if(BUILD_TESTS)
         src/threat_logic.cpp
     )
     add_test(NAME blind_nav_tests COMMAND blind_nav_tests)
+endif()
+
+# Инструмент для проверки реального NPU-инференса на статичных фото — нужен
+# на плате без камеры (main.cpp читает кадры только с cv::VideoCapture).
+# Требует настоящий librknnrt.so, поэтому собирается только по явному флагу
+# и обычно только на самой плате (aarch64 + подключённый NPU).
+# Запуск: cmake -DBUILD_IMAGE_TEST=ON .. && make rknn_image_test
+#         ./rknn_image_test ../model/yolo11_final.rknn фото1.jpg фото2.jpg
+option(BUILD_IMAGE_TEST "Собрать rknn_image_test — прогон инференса на статичных фото" OFF)
+if(BUILD_IMAGE_TEST)
+    add_executable(rknn_image_test
+        tests/rknn_image_test.cpp
+        src/rknn_inference.cpp
+        src/decode.cpp
+        src/threat_logic.cpp
+    )
+    target_link_libraries(rknn_image_test
+        ${OpenCV_LIBS}
+        ${RKNN_API_PATH}
+    )
 endif()
