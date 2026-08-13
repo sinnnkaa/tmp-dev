@@ -73,14 +73,16 @@ endif()
 # Замер реального FPS боевого пайплайна на видео (не на одном кадре) с
 # разбивкой по стадиям (препроцессинг / копирование в NPU / сам инференс /
 # деквантование / decode()) — для поиска узкого места производительности.
+# Также пишет размеченное видео с боксами и печатает сводку по классам.
 # Запуск: cmake -DBUILD_VIDEO_BENCH=ON .. && make rknn_video_bench
-#         ./rknn_video_bench ../model/yolo11_final.rknn видео.mp4
+#         ./rknn_video_bench ../model/yolo11_final.rknn вход.mp4 выход.avi
 option(BUILD_VIDEO_BENCH "Собрать rknn_video_bench — замер FPS на видео с разбивкой по стадиям" OFF)
 if(BUILD_VIDEO_BENCH)
     add_executable(rknn_video_bench
         tests/rknn_video_bench.cpp
         src/rknn_inference.cpp
         src/decode.cpp
+        src/threat_logic.cpp
     )
     target_link_libraries(rknn_video_bench
         ${OpenCV_LIBS}
