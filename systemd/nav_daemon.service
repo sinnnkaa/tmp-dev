@@ -1,6 +1,9 @@
 [Unit]
 Description=Voice Navigation Daemon
-After=network.target bt_keeper.service
+# osrm.service — не Requires: демон уже сам переживает недоступный OSRM
+# (периодически предупреждает голосом, см. OSRM_FAILURE_WARN_EVERY в
+# voice_nav_daemon.py), поэтому мягкий порядок запуска, а не жёсткая зависимость.
+After=network.target bt_keeper.service osrm.service
 # Ограничивает busy-loop рестартов (например, если отсутствует модель Vosk
 # или файл адресов) — без RestartSec тут был systemd-дефолт ~100мс,
 # что при отсутствующей зависимости давало рестарт-шторм.

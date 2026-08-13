@@ -1,0 +1,19 @@
+# Поднимает osrm-routed на 127.0.0.1:5000, к которому ходит
+# python/voice_nav_daemon.py (OSRM_URL). Граф уже собран и лежит в
+# ../../blind_nav/map/spb.osrm* (в git) — по умолчанию просто раздаём его.
+# Если нужно пересобрать граф из map/spb.pbf (обновилась карта) — см. README.md
+# рядом, там команды osrm-extract/partition/customize на этом же образе.
+#
+# Официальный образ Project OSRM мультиархитектурный (linux/amd64 и
+# linux/arm64) начиная с недавних тегов — на Orange Pi (aarch64) `docker pull`
+# сам возьмёт нужный слой, эмуляция не нужна.
+services:
+  osrm:
+    image: ghcr.io/project-osrm/osrm-backend:latest
+    container_name: blind_nav_osrm
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5000:5000"
+    volumes:
+      - ../../blind_nav/map:/data:ro
+    command: osrm-routed --algorithm mld /data/spb.osrm

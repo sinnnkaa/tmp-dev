@@ -29,7 +29,7 @@ echo "==> systemctl daemon-reload"
 systemctl daemon-reload
 
 echo "==> Включаю автозапуск сервисов (без старта прямо сейчас)"
-systemctl enable bt_keeper.service nav_daemon.service blind_nav_main.service
+systemctl enable bt_keeper.service nav_daemon.service blind_nav_main.service osrm.service
 
 cat <<'EOF'
 
@@ -39,8 +39,9 @@ cat <<'EOF'
        cmake .. && make -j4
   2. Проверить, что модель на месте: blind_nav/model/yolo11_final.rknn
   3. Проверить камеру, микрофон/наушники, GPS.
-  4. Запустить сервисы:
-       systemctl start bt_keeper.service nav_daemon.service blind_nav_main.service
+  4. Поставить Docker (нужен для osrm.service) — см. deploy/osrm/README.md.
+  5. Запустить сервисы:
+       systemctl start osrm.service bt_keeper.service nav_daemon.service blind_nav_main.service
 
 См. TESTING.md — чек-лист ручной проверки на плате.
 EOF

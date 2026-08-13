@@ -22,9 +22,9 @@ BlindNav — это программно-аппаратный комплекс �
 | :--- | :--- |
 | **CV Core** | C++17, RKNN API, OpenCV |
 | **AI Model** | YOLOv11-Nano (квантованная) |
-| **Routing** | OSRM, OpenStreetMap (`.pbf`) |
+| **Routing** | OSRM (в Docker), OpenStreetMap (`.pbf`) |
 | **TTS/STT** | Piper (ONNX), Vosk |
-| **Deployment** | Docker, systemd |
+| **Deployment** | Docker (только OSRM), systemd (остальные сервисы) |
 
 ### Архитектура комплекса
 
@@ -41,5 +41,28 @@ diplom-cpp/
 ├── piper/               # Нейросетевой синтез речи
 └── vosk/                # Локальное распознавание команд
 ```
+### Быстрый старт (Orange Pi, чистая плата)
+
+```bash
+git clone <repo> /root/diplom-cpp && cd /root/diplom-cpp
+
+# 1. Системные сервисы (systemd-юниты + автозапуск)
+sudo bash deploy/install.sh
+
+# 2. Сборка C++ ядра
+cd blind_nav && mkdir -p build && cd build
+cmake .. && make -j4
+cd ../..
+
+# 3. OSRM (Docker) — граф уже в git, ничего собирать не нужно
+sudo systemctl start osrm.service
+
+# 4. Остальные сервисы
+sudo systemctl start bt_keeper.service nav_daemon.service blind_nav_main.service
+```
+
+Подробности и чек-лист ручной проверки — в [TESTING.md](TESTING.md); сборка
+и пересборка графа OSRM — в [deploy/osrm/README.md](deploy/osrm/README.md).
+
 ---
 Проект демонстрирует эффективность применения NPU в мобильных встраиваемых системах для решения социально-значимых задач.
