@@ -1,0 +1,19 @@
+[Unit]
+Description=Bluetooth Major IV Keeper & PulseAudio
+After=bluetooth.service sound.target
+# Ограничивает busy-loop рестартов: без этого зацикленное падение сервиса
+# каждые 5 секунд убивало бы pulseaudio на каждой попытке (см. bt_keeper.sh)
+# и рвало звук во всех остальных процессах комплекса.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+Environment=PULSE_RUNTIME_PATH=/run/user/0/pulse
+ExecStart=/bin/bash /root/bt_keeper.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

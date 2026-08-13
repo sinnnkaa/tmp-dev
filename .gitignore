@@ -1,0 +1,34 @@
+# Сборочные артефакты
+blind_nav/build/
+*.o
+
+# Python
+python/__pycache__/
+python/tests/__pycache__/
+**/__pycache__/
+*.pyc
+
+# Рантайм-артефакты, которые пишет сама система на плате
+system_audio.raw
+mic_audio.raw
+output_video_a.avi
+output_video_b.avi
+tests/output_video.avi
+tests/system_audio.raw
+tests/system_audio.wav
+tests/mic_audio.raw
+tests/mic_audio.wav
+
+# Промежуточные версии модели — в git остаётся только подтверждённо
+# рабочая yolo11_final.rknn.
+blind_nav/model/yolo11_stable.rknn
+blind_nav/model/yolo11_smart.rknn
+blind_nav/model/yolo11_blind.rknn
+
+# Дубликат: тот же spb.pbf уже лежит в map/ (сырой источник для OSRM).
+# В blind_nav/map/ нужны только обработанные spb.osrm.* — то, что реально
+# грузит osrm-routed на плате.
+blind_nav/map/spb.pbf
+
+# Разовые тестовые медиафайлы, не используемые ни одним путём в коде
+blind_nav/13307997_2560_1440_30fps.mp4

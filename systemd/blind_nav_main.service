@@ -1,0 +1,20 @@
+[Unit]
+Description=Main C++ Vision System for Blind Nav
+After=network.target bt_keeper.service nav_daemon.service
+Requires=nav_daemon.service
+# Ограничивает бесконечный busy-loop рестартов: если сервис не может
+# подняться 5 раз за 60 секунд (например, нет модели/камеры), systemd
+# останавливает попытки вместо бесконечного цикла падений каждые 3 секунды.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Environment="PULSE_RUNTIME_PATH=/run/user/0/pulse"
+ExecStart=/root/diplom-cpp/systemd/blind_nav.sh
+WorkingDirectory=/root/diplom-cpp/blind_nav/build
+Restart=always
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target
