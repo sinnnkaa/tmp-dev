@@ -1,0 +1,52 @@
+# Отображение классов внешних открытых датасетов в наши 10 классов.
+#
+# Ключ — наш класс из E:\DATASET\dataset.yaml (порядок id важен, он зашит
+# в decode.cpp и в озвучку). Значение — список имён классов источника,
+# которые в него сливаются. Имена написаны ровно так, как в источнике:
+# Open Images различает регистр ("Traffic sign", не "traffic sign").
+#
+# Пустой список = класса в этом источнике нет, добирать его придётся
+# из сегментационных датасетов или своей съёмки (см. README.md).
+
+classes:
+  0: person
+  1: car
+  2: curb
+  3: pole
+  4: traffic_sign
+  5: traffic_light
+  6: trash_can
+  7: bench
+  8: sidewalk
+  9: crosswalk
+
+open-images-v7:
+  # Man/Woman/Boy/Girl намеренно не берём: в Open Images они размечены
+  # поверх Person, и объединение дало бы два бокса на одного человека.
+  person:        ["Person"]
+  # Все безрельсовые машины в один класс — так же размечен текущий датасет
+  # (отдельного "truck"/"bus" в наших 10 классах нет).
+  car:           ["Car", "Van", "Truck", "Bus"]
+  curb:          []
+  # Уличный фонарь — единственный вертикальный столб с боксами в Open Images.
+  # Это подмножество нашего "pole" (нет светофорных и дорожных опор),
+  # поэтому источник поднимает полноту, но не заменяет разметку с нуля.
+  pole:          ["Street light"]
+  traffic_sign:  ["Traffic sign", "Stop sign"]
+  traffic_light: ["Traffic light"]
+  trash_can:     ["Waste container"]
+  bench:         ["Bench"]
+  sidewalk:      []
+  crosswalk:     []
+
+coco-2017:
+  person:        ["person"]
+  car:           ["car", "truck", "bus"]
+  curb:          []
+  pole:          []
+  traffic_sign:  ["stop sign"]
+  traffic_light: ["traffic light"]
+  trash_can:     []
+  bench:         ["bench"]
+  sidewalk:      []
+  crosswalk:     []
