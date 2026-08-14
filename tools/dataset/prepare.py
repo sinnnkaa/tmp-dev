@@ -29,6 +29,7 @@ import argparse
 import hashlib
 import os
 import random
+import re
 import shutil
 import sys
 
@@ -42,6 +43,8 @@ REAL_HEIGHT = {0: 1.70, 1: 1.50, 2: 0.15, 3: 3.00, 4: 0.70,
                5: 0.80, 6: 0.60, 7: 0.60, 8: 0.05, 9: 0.05}
 
 IMG_EXT = (".jpg", ".jpeg", ".png", ".bmp")
+# Так помечены офлайн-копии в исходном датасете: "<id>_aug_0.jpg".
+AUG_RE = re.compile(r"_aug_\d+$")
 
 
 def near_field_frac(cid):
@@ -126,6 +129,10 @@ def main():
                     help="Минимальная высота бокса в долях кадра (0.03 ~ 16 px при входе 512)")
     ap.add_argument("--val-frac", type=float, default=0.1)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--skip-aug", action="store_true",
+                    help="Пропускать офлайн-аугментации (*_aug_0.jpg и т.п.). В исходном "
+                         "датасете это 58%% train и копии тех же кадров: они втрое удлиняют "
+                         "эпоху, а ultralytics всё равно аугментирует на лету и разнообразнее")
     ap.add_argument("--link", action="store_true",
                     help="Жёсткие ссылки вместо копирования (быстрее, но только в пределах тома)")
     ap.add_argument("--dry-run", action="store_true", help="Только статистика, ничего не писать")
@@ -153,9 +160,14 @@ def main():
     seen_hashes = {}
     items = []  # (img_path, [строки разметки])
 
+    skipped_aug = 0
     for src in args.src:
         n_src = 0
         for img_path, lbl_path in iter_pairs(src):
+            stem_name = os.path.splitext(os.path.basename(img_path))[0]
+            if args.skip_aug and AUG_RE.search(stem_name):
+                skipped_aug += 1
+                continue
             rows, broken = read_label(lbl_path)
             broken_total += broken
             kept = []
@@ -191,6 +203,8 @@ def main():
 
     print(f"\nВсего {len(items)} изображений (train {len(splits['train'])}, val {n_val})")
     print(f"Битых строк разметки пропущено: {broken_total}")
+    if args.skip_aug:
+        print(f"Офлайн-аугментаций пропущено: {skipped_aug}")
     print(f"Боксов отброшено: мелких {dropped_small}, по --drop {dropped_class}")
     print(f"\n{'класс':<14}{'боксов':>10}{'ближняя зона':>16}")
     for cid in sorted(stats):
