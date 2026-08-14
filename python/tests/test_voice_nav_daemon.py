@@ -11,6 +11,7 @@
 """
 import os
 import sys
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -88,11 +89,13 @@ class FindCoordinatesTests(unittest.TestCase):
 
 class LogCapTests(unittest.TestCase):
     def setUp(self):
-        self.path = "/tmp/claude-1000/-home-sinitsina----------diplom-cpp-backup-2026-08-12/cb6829ed-5e25-4884-bb02-94f51fd67b4d/scratchpad/test_cap_log.raw"
+        # Временный каталог, а не фиксированный путь: тесты должны проходить
+        # и на машине разработки, и на плате.
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self._tmpdir.name, "test_cap_log.raw")
 
     def tearDown(self):
-        if os.path.exists(self.path):
-            os.remove(self.path)
+        self._tmpdir.cleanup()
 
     def test_truncates_when_over_limit(self):
         with open(self.path, "wb") as f:
