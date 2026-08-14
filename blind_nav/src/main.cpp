@@ -49,6 +49,12 @@ const char* AUDIO_LOCK_PATH = "/run/lock/blind_nav_audio.lock";
 const char* AUDIO_LOG_PATH = "/root/diplom-cpp/system_audio.raw";
 const long AUDIO_LOG_MAX_BYTES = 20L * 1024 * 1024;
 
+// Квантованная модель: 25.3 FPS против 10.6 у прежней FP16-версии при падении
+// полноты в опасной зоне на 2% по машинам и 5% по людям (замеры — METRICS.md).
+// Прежняя yolo11_final.rknn оставлена рядом: чтобы вернуться, достаточно
+// поменять путь здесь и пересобрать, формат выходов у моделей одинаковый.
+const char* MODEL_PATH = "/root/diplom-cpp/blind_nav/model/yolo11_int8.rknn";
+
 const char* VIDEO_PATH_A = "/root/diplom-cpp/output_video_a.avi";
 const char* VIDEO_PATH_B = "/root/diplom-cpp/output_video_b.avi";
 const long VIDEO_MAX_BYTES = 500L * 1024 * 1024;
@@ -307,7 +313,7 @@ int main(int argc, char** argv) {
     std::signal(SIGTERM, handle_signal);
 
     RKNNModel model;
-    if (!model.load("/root/diplom-cpp/blind_nav/model/yolo11_final.rknn")) {
+    if (!model.load(MODEL_PATH)) {
         std::cerr << "Ошибка загрузки модели!" << std::endl;
         return -1;
     }
