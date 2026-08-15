@@ -33,6 +33,7 @@ import re
 import shutil
 import sys
 
+import cv2
 import yaml
 
 # Совпадает с blind_nav/src/main.cpp и threat_logic.cpp.
@@ -133,6 +134,10 @@ def main():
                     help="Пропускать офлайн-аугментации (*_aug_0.jpg и т.п.). В исходном "
                          "датасете это 58%% train и копии тех же кадров: они втрое удлиняют "
                          "эпоху, а ultralytics всё равно аугментирует на лету и разнообразнее")
+    ap.add_argument("--max-side", type=int, default=0,
+                    help="Ужать длинную сторону до N px (0 — копировать как есть). "
+                         "Учим на 640, поэтому хранить и возить оригиналы незачем. "
+                         "Несовместимо с --link: пересжатие требует записи нового файла")
     ap.add_argument("--link", action="store_true",
                     help="Жёсткие ссылки вместо копирования (быстрее, но только в пределах тома)")
     ap.add_argument("--dry-run", action="store_true", help="Только статистика, ничего не писать")
@@ -234,7 +239,17 @@ def main():
         for img_path, lines in rows:
             base = os.path.basename(img_path)
             dst = os.path.join(img_dir, base)
-            if args.link:
+            if args.max_side:
+                img = cv2.imread(img_path)
+                if img is None:
+                    continue
+                h, w = img.shape[:2]
+                if max(h, w) > args.max_side:
+                    k = args.max_side / max(h, w)
+                    img = cv2.resize(img, (round(w * k), round(h * k)),
+                                     interpolation=cv2.INTER_AREA)
+                cv2.imwrite(dst, img, [cv2.IMWRITE_JPEG_QUALITY, 88])
+            elif args.link:
                 if not os.path.exists(dst):
                     os.link(img_path, dst)
             else:

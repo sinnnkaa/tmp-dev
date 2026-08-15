@@ -24,6 +24,7 @@ import os
 import shutil
 import sys
 
+import cv2
 import yaml
 
 SOURCES = {
@@ -56,12 +57,36 @@ def main():
                     help="Ограничение сверху; без него Open Images качается сутками")
     ap.add_argument("--out", required=True, help="Каталог для images/ и labels/")
     ap.add_argument("--config", default=os.path.join(os.path.dirname(__file__), "sources.yaml"))
+    ap.add_argument("--shuffle", action="store_true",
+                    help="Перемешать перед отбором. Без этого fiftyone отдаёт кадры в одном "
+                         "и том же порядке, и второй проход по тем же классам приносит ровно "
+                         "те же картинки — нулевую прибавку")
+    ap.add_argument("--sample-seed", type=int, default=51,
+                    help="Зерно перемешивания: разные значения дают разные подвыборки")
+    ap.add_argument("--max-side", type=int, default=0,
+                    help="Ужать длинную сторону до N px при сохранении (0 — как есть). "
+                         "Open Images отдаёт 1024 px, а учим на 640: хранить originals "
+                         "смысла нет, 640 режет объём примерно втрое")
+    ap.add_argument("--seed-classes", default="",
+                    help="Отбирать кадры по этим классам источника (через запятую), "
+                         "напр. \"Waste container,Bench\". Нужно для редких классов: "
+                         "без этого выборка забивается людьми и машинами. Разметка "
+                         "всё равно берётся по всем нашим классам")
     ap.add_argument("--dry-run", action="store_true",
                     help="Показать, что будет скачано, и выйти")
     args = ap.parse_args()
 
     names, mapping = load_mapping(args.config, args.source)
+    # Отбор кадров и разметка — разные множества классов. Отбираем по редким,
+    # а размечаем всё, что знаем: иначе люди и машины на этих кадрах останутся
+    # без боксов и модель выучит их как фон.
     wanted = sorted(mapping)
+    if args.seed_classes:
+        seeds = [s.strip() for s in args.seed_classes.split(",") if s.strip()]
+        unknown = [s for s in seeds if s not in mapping]
+        if unknown:
+            sys.exit(f"Нет в sources.yaml для {args.source}: {', '.join(unknown)}")
+        wanted = seeds
     print(f"Источник:  {args.source} / {args.split}")
     print(f"Классы:    {', '.join(wanted)}")
     print(f"Лимит:     {args.max_samples} изображений")
@@ -82,7 +107,9 @@ def main():
         label_types=["detections"],
         classes=wanted,
         max_samples=args.max_samples,
-        dataset_name=f"bn_{args.source}_{args.split}_{args.max_samples}",
+        shuffle=args.shuffle,
+        seed=args.sample_seed,
+        dataset_name=f"bn_{args.source}_{args.split}_{args.max_samples}_{args.sample_seed}",
     )
 
     img_dir = os.path.join(args.out, "images")
@@ -116,7 +143,19 @@ def main():
         ext = os.path.splitext(sample.filepath)[1] or ".jpg"
         # Префикс источника, чтобы имена не столкнулись при слиянии датасетов.
         stem = f"{args.source.split('-')[0]}_{stem}"
-        shutil.copyfile(sample.filepath, os.path.join(img_dir, stem + ext))
+        dst = os.path.join(img_dir, stem + ext)
+        if args.max_side:
+            img = cv2.imread(sample.filepath)
+            if img is None:
+                continue
+            h, w = img.shape[:2]
+            if max(h, w) > args.max_side:
+                k = args.max_side / max(h, w)
+                img = cv2.resize(img, (round(w * k), round(h * k)), interpolation=cv2.INTER_AREA)
+            # Разметка нормированная, пересчитывать её при масштабировании не нужно.
+            cv2.imwrite(dst, img, [cv2.IMWRITE_JPEG_QUALITY, 88])
+        else:
+            shutil.copyfile(sample.filepath, dst)
         with open(os.path.join(lbl_dir, stem + ".txt"), "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
         kept_images += 1
