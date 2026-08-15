@@ -57,7 +57,10 @@ const char* MODEL_PATH = "/root/diplom-cpp/blind_nav/model/yolo11_int8.rknn";
 
 const char* VIDEO_PATH_A = "/root/diplom-cpp/output_video_a.avi";
 const char* VIDEO_PATH_B = "/root/diplom-cpp/output_video_b.avi";
-const long VIDEO_MAX_BYTES = 500L * 1024 * 1024;
+// Потолок записи — 500 МБ суммарно, поэтому на каждый из двух файлов кольца
+// приходится половина. При 90 МБ/час это около пяти с половиной часов истории.
+const long VIDEO_TOTAL_MAX_BYTES = 500L * 1024 * 1024;
+const long VIDEO_MAX_BYTES = VIDEO_TOTAL_MAX_BYTES / 2;
 
 std::atomic<bool> is_navigating(false);
 std::atomic<bool> keep_running(true);
@@ -104,9 +107,9 @@ struct LastSpokenState {
 } last_spoken_state;
 
 // Пишет кадры в output_video_{a,b}.avi по кругу: как только текущий файл
-// превышает VIDEO_MAX_BYTES, второй (более старый) файл удаляется и запись
-// продолжается в него. Это ограничивает суммарный рост записи двумя файлами
-// вместо бесконечно растущего output_video.avi.
+// превышает VIDEO_MAX_BYTES, запись переключается на второй файл и затирает
+// его содержимое. Только что заполненный файл остаётся на диске — он и есть
+// сохранённая история. Суммарный размер ограничен двумя файлами.
 class VideoRotator {
 public:
     void write(const cv::Mat& frame) {
@@ -133,11 +136,13 @@ private:
     cv::VideoWriter writer;
 
     const char* current_path() const { return use_a ? VIDEO_PATH_A : VIDEO_PATH_B; }
-    const char* other_path() const { return use_a ? VIDEO_PATH_B : VIDEO_PATH_A; }
 
     void open_new() {
         if (writer.isOpened()) writer.release();
-        std::remove(other_path());
+        // Файл под запись открывается на усечение, поэтому удалять его руками
+        // не нужно. Раньше здесь стоял std::remove(other_path()) — он стирал
+        // не старый файл, а только что дописанный, и после каждого
+        // переключения история обнулялась.
         writer.open(current_path(), cv::VideoWriter::fourcc('M', 'J', 'P', 'G'), 30.0,
                     cv::Size(FRAME_WIDTH, FRAME_HEIGHT));
     }
