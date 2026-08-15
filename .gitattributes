@@ -1,0 +1,16 @@
+# Репозиторий редактируется с Windows (core.autocrlf=true), а исполняется на
+# Orange Pi. Файлы, которые запускает Linux, обязаны лежать с переводами строк
+# LF в любом случае: скрипт с CRLF падает при запуске с "bad interpreter:
+# /bin/bash^M", а systemd-юнит с CRLF даёт ошибки разбора директив.
+*.sh      text eol=lf
+*.service text eol=lf
+
+# Бинарные файлы git не должен трогать вовсе, иначе нормализация переводов
+# строк их портит.
+*.rknn binary
+*.onnx binary
+*.pt   binary
+*.avi  binary
+*.jpg  binary
+*.png  binary
+*.raw  binary
