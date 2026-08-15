@@ -22,6 +22,18 @@ fi
 echo "==> Копирую systemd-юниты в /etc/systemd/system/"
 cp "$REPO_DIR"/systemd/*.service /etc/systemd/system/
 
+# Юнит из ранних установок: запускал blind_nav/build/start_nav.sh, которого в
+# репозитории давно нет. Оставаясь enabled, он на каждой загрузке пять раз
+# падал и вставал в failed, а если бы скрипт вернулся — дрался бы за камеру с
+# blind_nav_main.service. В репозитории его нет, поэтому cp выше его не
+# перезапишет: убираем явно.
+if [ -f /etc/systemd/system/blind_nav.service ]; then
+    echo "==> Убираю устаревший blind_nav.service"
+    systemctl disable --now blind_nav.service 2>/dev/null || true
+    mv /etc/systemd/system/blind_nav.service /root/blind_nav.service.obsolete
+    echo "    перемещён в /root/blind_nav.service.obsolete"
+fi
+
 echo "==> Симлинкую /root/bt_keeper.sh -> $REPO_DIR/systemd/bt_keeper.sh"
 ln -sf "$REPO_DIR/systemd/bt_keeper.sh" /root/bt_keeper.sh
 

@@ -1,12 +1,20 @@
 [Unit]
 Description=Main C++ Vision System for Blind Nav
 After=network.target bt_keeper.service nav_daemon.service
-Requires=nav_daemon.service
+# Wants, а не Requires: предупреждение о препятствиях — основная функция
+# устройства, и она не должна отключаться из-за упавшего демона маршрутов.
+# При Requires падение nav_daemon.service уводило за собой и зрение, то есть
+# отказ вспомогательной части гасил защитную.
+Wants=nav_daemon.service
 # Ограничивает бесконечный busy-loop рестартов: если сервис не может
 # подняться 5 раз за 60 секунд (например, нет модели/камеры), systemd
 # останавливает попытки вместо бесконечного цикла падений каждые 3 секунды.
 StartLimitIntervalSec=60
 StartLimitBurst=5
+# Ровно один владелец камеры и звука. Устаревший blind_nav.service остаётся
+# на части плат после старых установок; при одновременном запуске оба процесса
+# дерутся за /dev/video и звуковое устройство.
+Conflicts=blind_nav.service
 
 [Service]
 Environment="PULSE_RUNTIME_PATH=/run/user/0/pulse"
@@ -15,6 +23,11 @@ WorkingDirectory=/root/diplom-cpp/blind_nav/build
 Restart=always
 RestartSec=3
 User=root
+# Приоритет выше остальных частей комплекса: это единственный процесс, у
+# которого задержка означает непроизнесённое вовремя предупреждение.
+Nice=-5
+# Освобождение камеры при остановке не должно затягивать выключение платы.
+TimeoutStopSec=15
 
 [Install]
 WantedBy=multi-user.target

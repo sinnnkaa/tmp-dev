@@ -1,5 +1,6 @@
 #include <iostream>
 #include <fstream>
+#include <sstream>
 #include <chrono>
 #include <vector>
 #include <string>
@@ -602,12 +603,26 @@ int main(int argc, char** argv) {
         auto end_time = std::chrono::high_resolution_clock::now();
         std::chrono::duration<float, std::milli> total_ms = end_time - start_time;
 
-        if (frame_count % 10 == 0) {
+        // Строка состояния. В терминале она перерисовывается на месте через \r,
+        // но под systemd терминала нет: journald считает возврат каретки
+        // управляющим символом, не закрывает запись до перевода строки и
+        // копит всё в один кусок — в журнале это выглядело как повторяющееся
+        // "[48.0K blob data]" и давало около 20 МБ записи в сутки. Поэтому в
+        // журнал пишем обычными строками и на два порядка реже.
+        static const bool stdout_is_tty = isatty(fileno(stdout));
+        const int status_every = stdout_is_tty ? 10 : 750;  // ~0.4 с и ~30 с при 25 FPS
+        if (frame_count % status_every == 0) {
             std::string priority_info = (max_danger > 0) ? get_class_name_ru(best_class_id) : "Чисто";
-            std::cout << "\r[Кадр " << frame_count << "] Треков: " << tracking_list.size()
-                      << " | Темп: " << get_temperature() << " C"
-                      << " | Цель: " << priority_info
-                      << " | Инференс: " << total_ms.count() << " ms      " << std::flush;
+            std::ostringstream status;
+            status << "[Кадр " << frame_count << "] Треков: " << tracking_list.size()
+                   << " | Темп: " << get_temperature() << " C"
+                   << " | Цель: " << priority_info
+                   << " | Инференс: " << total_ms.count() << " ms";
+            if (stdout_is_tty) {
+                std::cout << "\r" << status.str() << "      " << std::flush;
+            } else {
+                std::cout << status.str() << std::endl;
+            }
         }
         frame_count++;
     }
