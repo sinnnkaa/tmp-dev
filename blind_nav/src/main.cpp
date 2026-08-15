@@ -24,7 +24,37 @@ const float FOCAL_LENGTH = 450.0f;
 const int FRAME_WIDTH = 640;
 const int FRAME_HEIGHT = 480;
 
-const float CONF_THRESHOLD = 0.30f;
+// Порог уверенности по классам: цена ошибки у классов разная, поэтому одна
+// константа на всех — компромисс не в ничью пользу. Замер на INT8-модели
+// (500 кадров val, только зона < 7 м, tools/eval/run_thresh_sweep_rknn.py)
+// показал, что смягчение порога окупается ровно у одного класса:
+// traffic_light при 0.25 даёт полноту 0.62 против 0.40 и точность 0.57
+// против 0.55 — лучше сразу по обоим показателям, а не в обмен.
+// У остальных снижение порога только меняет пропуски на ложные срабатывания
+// (у pole при 0.10 полнота 0.73, но точность 0.28), поэтому им оставлен 0.30.
+// Развёртка целиком — в METRICS.md.
+const int CONF_CLASS_COUNT = 10;
+const float CONF_THRESHOLD_BY_CLASS[CONF_CLASS_COUNT] = {
+    0.30f,  // 0 person
+    0.30f,  // 1 car
+    0.30f,  // 2 curb
+    0.30f,  // 3 pole
+    0.30f,  // 4 traffic_sign
+    0.25f,  // 5 traffic_light
+    0.30f,  // 6 trash_can
+    0.30f,  // 7 bench
+    0.30f,  // 8 sidewalk
+    0.30f,  // 9 crosswalk
+};
+// Декодируем по самому мягкому из порогов, отсев по классам идёт после NMS.
+// Порядок важен: если резать до NMS, подавление считается по другому набору
+// кандидатов, и замер порогов перестаёт соответствовать поведению устройства.
+const float CONF_THRESHOLD_MIN = 0.25f;
+
+float conf_threshold_for(int class_id) {
+    if (class_id < 0 || class_id >= CONF_CLASS_COUNT) return 0.30f;
+    return CONF_THRESHOLD_BY_CLASS[class_id];
+}
 const float MAX_DANGER_DIST = 7.0f;
 const float ROI_TOP_MARGIN = 0.30f;
 
@@ -381,7 +411,12 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
             continue;
         }
-        auto results = decode(raw_out, 512, 512, frame.cols, frame.rows, CONF_THRESHOLD);
+        auto results = decode(raw_out, 512, 512, frame.cols, frame.rows, CONF_THRESHOLD_MIN);
+        results.erase(std::remove_if(results.begin(), results.end(),
+                                     [](const Detection& d) {
+                                         return d.score < conf_threshold_for(d.class_id);
+                                     }),
+                      results.end());
 
         std::vector<RenderBox> current_boxes;
 
