@@ -174,27 +174,39 @@ def main():
                 skipped_aug += 1
                 continue
             rows, broken = read_label(lbl_path)
-            broken_total += broken
-            kept = []
+            kept, kept_meta = [], []
+            n_small = n_class = 0
             for cid, cx, cy, w, h in rows:
                 if cid in drop_ids:
-                    dropped_class += 1
+                    n_class += 1
                     continue
                 if h < args.min_box_frac:
-                    dropped_small += 1
+                    n_small += 1
                     continue
                 kept.append(f"{cid} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
-                stats.setdefault(cid, [0, 0])
-                stats[cid][0] += 1
-                nf = near_field_frac(cid)
-                if nf is not None and h >= nf:
-                    stats[cid][1] += 1
+                kept_meta.append((cid, h))
             if not kept:
                 continue
             digest = file_hash(img_path)
             if digest in seen_hashes:
                 continue
             seen_hashes[digest] = img_path
+
+            # Счётчики обновляются только для принятого кадра. Раньше они росли
+            # до проверки дубликатов, поэтому в отчёт попадали боксы картинок,
+            # которые в датасет не вошли: проход по уже скачанному пулу
+            # источника принимал ноль кадров, а числа классов в сводке от него
+            # заметно подрастали.
+            broken_total += broken
+            dropped_small += n_small
+            dropped_class += n_class
+            for cid, h in kept_meta:
+                stats.setdefault(cid, [0, 0])
+                stats[cid][0] += 1
+                nf = near_field_frac(cid)
+                if nf is not None and h >= nf:
+                    stats[cid][1] += 1
+
             items.append((img_path, kept))
             n_src += 1
         print(f"{src}: {n_src} изображений принято")
