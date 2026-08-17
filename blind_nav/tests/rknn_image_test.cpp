@@ -26,7 +26,7 @@ namespace {
 
 constexpr int INPUT_SIZE = 512;
 constexpr float CONF_THRESHOLD = 0.30f;
-constexpr float FOCAL_LENGTH = 450.0f;  // как в main.cpp — калибровка под камеру платы
+constexpr float FOCAL_LENGTH = 252.0f;  // как в main.cpp — прикидка из даташита, не откалибровано (см. CALIBRATION.md)
 
 void process_image(RKNNModel& model, const std::string& path) {
     cv::Mat img = cv::imread(path, cv::IMREAD_COLOR);  // BGR, как отдаёт VideoCapture

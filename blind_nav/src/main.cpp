@@ -21,7 +21,16 @@
 #include "decode.h"
 #include "threat_logic.h"
 
-const float FOCAL_LENGTH = 450.0f;
+// Черновая замена значению "450 на глаз": пересчитано из даташита камеры
+// (OV3660, FOV 110°) через f_px = (W/2) / tan(FOV/2) для 640x480 — 224 px,
+// если FOV горизонтальный, и 280 px, если диагональный (в даташите не
+// уточняется). Взято среднее. Это ПРИКИДКА, не калибровка: для 110°-объектива
+// pinhole-модель у краёв кадра будет заметно врать из-за дисторсии, а сама
+// формула тонкой линзы (1.85 мм + 1/5" матрица) даёт ~82° вместо заявленных
+// 110°, то есть даташит внутренне противоречив. Заменить на измеренное
+// значение по шагу 1 CALIBRATION.md, как только камера будет в руках, и
+// сверить по шагу 4 — не подставлять как окончательное.
+const float FOCAL_LENGTH = 252.0f;
 const int FRAME_WIDTH = 640;
 const int FRAME_HEIGHT = 480;
 
@@ -179,6 +188,33 @@ private:
     }
 };
 
+// Без явного FOURCC V4L2-бэкенд может договориться с камерой на YUYV вместо
+// MJPG, а на части USB-камер (в т.ч. на нашей — см. даташит) YUYV на 640x480
+// снят с потолком 8 кадров/с против 20 у MJPG, тогда как cap.set(CAP_PROP_FPS,
+// 30) ниже ничего не гарантирует и молча не сработает. Поэтому фиксируем
+// формат явно и логируем то, что камера реально согласовала, а не то, что
+// запрошено — расхождение будет видно в логе, а не всплывёт только на
+// реальном устройстве.
+void apply_camera_props(cv::VideoCapture& cap) {
+    cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+    cap.set(cv::CAP_PROP_FRAME_WIDTH, FRAME_WIDTH);
+    cap.set(cv::CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT);
+    cap.set(cv::CAP_PROP_FPS, 30);
+
+    int fourcc = static_cast<int>(cap.get(cv::CAP_PROP_FOURCC));
+    char fourcc_str[5] = {
+        static_cast<char>(fourcc & 0xFF),
+        static_cast<char>((fourcc >> 8) & 0xFF),
+        static_cast<char>((fourcc >> 16) & 0xFF),
+        static_cast<char>((fourcc >> 24) & 0xFF),
+        '\0'
+    };
+    std::cerr << "[Camera Thread] Согласовано с камерой: " << fourcc_str << " "
+              << cap.get(cv::CAP_PROP_FRAME_WIDTH) << "x" << cap.get(cv::CAP_PROP_FRAME_HEIGHT)
+              << " @ " << cap.get(cv::CAP_PROP_FPS) << " fps (запрошено "
+              << FRAME_WIDTH << "x" << FRAME_HEIGHT << " @ 30 fps)" << std::endl;
+}
+
 void camera_thread_func(int camera_index) {
     cv::VideoCapture cap(camera_index, cv::CAP_V4L2);
     if (!cap.isOpened()) cap.open(camera_index);
@@ -188,9 +224,7 @@ void camera_thread_func(int camera_index) {
         return;
     }
 
-    cap.set(cv::CAP_PROP_FRAME_WIDTH, FRAME_WIDTH);
-    cap.set(cv::CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT);
-    cap.set(cv::CAP_PROP_FPS, 30);
+    apply_camera_props(cap);
 
     VideoRotator video_out;
     auto last_good_frame = std::chrono::steady_clock::now();
@@ -243,9 +277,7 @@ void camera_thread_func(int camera_index) {
                 cap.open(camera_index, cv::CAP_V4L2);
                 if (!cap.isOpened()) cap.open(camera_index);
                 if (cap.isOpened()) {
-                    cap.set(cv::CAP_PROP_FRAME_WIDTH, FRAME_WIDTH);
-                    cap.set(cv::CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT);
-                    cap.set(cv::CAP_PROP_FPS, 30);
+                    apply_camera_props(cap);
                     std::cerr << "[Camera Thread] Камера переоткрыта." << std::endl;
                 } else {
                     std::cerr << "[Camera Thread] Переоткрыть камеру не удалось, повторю позже." << std::endl;
