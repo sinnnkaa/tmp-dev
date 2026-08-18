@@ -100,6 +100,24 @@ def switch_bt_profile(profile, verify_timeout=3.0):
     return False
 
 
+def play_ready_tone():
+    """Короткий двухтоновый сигнал (~180мс) сразу после подтверждённого
+    переключения на HFP-гарнитуру — вместо молчаливой паузы явно подсказывает
+    пользователю, что микрофон уже слушает и можно говорить. Играется через
+    тот же flock/AUDIO_LOCK_PATH, что и speak(), чтобы не наложиться на
+    предупреждения об опасности из C++ ядра."""
+    inner = (
+        'ffmpeg -loglevel quiet -f lavfi -i "sine=frequency=740:duration=0.08" '
+        '-f lavfi -i "sine=frequency=1050:duration=0.10" '
+        '-filter_complex "[0:a][1:a]concat=n=2:v=0:a=1,volume=0.35" '
+        '-ar 22050 -ac 1 -f s16le - | '
+        'aplay -D default -r 22050 -f S16_LE -t raw -c 1 2>/dev/null'
+    )
+    custom_env = os.environ.copy()
+    custom_env["PULSE_RUNTIME_PATH"] = "/run/user/0/pulse"
+    subprocess.run(["flock", AUDIO_LOCK_PATH, "-c", inner], env=custom_env)
+
+
 def speak(text, sync=False):
     print(f"[Голос]: {text}")
     safe_text = shlex.quote(text)
@@ -239,7 +257,7 @@ def confirm_address(model, address_name):
     от того, что нечёткий поиск (Левенштейн/difflib) подберёт похожий, но не тот адрес."""
     speak(f"Вы имели в виду {address_name}? Скажите да или нет.", sync=True)
     switch_bt_profile("handsfree_head_unit")
-    time.sleep(0.3)
+    play_ready_tone()
 
     answer = listen_and_transcribe(model, 4)
 
@@ -257,7 +275,7 @@ def navigation_worker(model, addresses_db, address_keys):
 
     speak("Слушаю адрес", sync=True)
     switch_bt_profile("handsfree_head_unit")
-    time.sleep(0.3)
+    play_ready_tone()
 
     print("[STT] Говорите...")
     user_input = listen_and_transcribe(model, 7)
