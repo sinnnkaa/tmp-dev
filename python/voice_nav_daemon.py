@@ -64,10 +64,15 @@ def cap_log_file(path, max_bytes):
         print(f"[LogCap] Не удалось обрезать {path}: {e}")
 
 
-def switch_bt_profile(profile):
+def switch_bt_profile(profile, verify_timeout=3.0):
+    """Переключает профиль и дожидается, пока Pulse подтвердит переход, а не
+    угадывает время фиксированным sleep. pactl возвращается сразу после того,
+    как поставил команду в очередь — согласование HFP/SCO с самой гарнитурой
+    может занять дольше, и раньше начало фразы пользователя (например "да")
+    терялось, пока микрофон ещё не был готов."""
+    custom_env = os.environ.copy()
+    custom_env["PULSE_RUNTIME_PATH"] = "/run/user/0/pulse"
     try:
-        custom_env = os.environ.copy()
-        custom_env["PULSE_RUNTIME_PATH"] = "/run/user/0/pulse"
         subprocess.run(
             ["pactl", "set-card-profile", BT_CARD, profile],
             check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -75,6 +80,24 @@ def switch_bt_profile(profile):
         )
     except Exception as e:
         print(f"[BT Error] Не удалось переключить профиль: {e}")
+        return False
+
+    deadline = time.time() + verify_timeout
+    while time.time() < deadline:
+        try:
+            out = subprocess.run(
+                ["pactl", "list", "cards"], capture_output=True, text=True,
+                env=custom_env
+            ).stdout
+        except Exception:
+            break
+        idx = out.find(BT_CARD)
+        if idx != -1 and f"Active Profile: {profile}" in out[idx:idx + 2000]:
+            return True
+        time.sleep(0.1)
+
+    print(f"[BT Error] Профиль {profile} не подтверждён за {verify_timeout}с — продолжаю без гарантии готовности микрофона.")
+    return False
 
 
 def speak(text, sync=False):
@@ -216,7 +239,7 @@ def confirm_address(model, address_name):
     от того, что нечёткий поиск (Левенштейн/difflib) подберёт похожий, но не тот адрес."""
     speak(f"Вы имели в виду {address_name}? Скажите да или нет.", sync=True)
     switch_bt_profile("handsfree_head_unit")
-    time.sleep(0.5)
+    time.sleep(0.3)
 
     answer = listen_and_transcribe(model, 4)
 
@@ -234,7 +257,7 @@ def navigation_worker(model, addresses_db, address_keys):
 
     speak("Слушаю адрес", sync=True)
     switch_bt_profile("handsfree_head_unit")
-    time.sleep(0.5)
+    time.sleep(0.3)
 
     print("[STT] Говорите...")
     user_input = listen_and_transcribe(model, 7)
