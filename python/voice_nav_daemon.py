@@ -214,9 +214,9 @@ def listen_and_transcribe(model, seconds):
 def confirm_address(model, address_name):
     """Голосовое подтверждение найденного адреса перед стартом маршрута — защита
     от того, что нечёткий поиск (Левенштейн/difflib) подберёт похожий, но не тот адрес."""
+    speak(f"Вы имели в виду {address_name}? Скажите да или нет.", sync=True)
     switch_bt_profile("handsfree_head_unit")
     time.sleep(0.5)
-    speak(f"Вы имели в виду {address_name}? Скажите да или нет.", sync=True)
 
     answer = listen_and_transcribe(model, 4)
 
