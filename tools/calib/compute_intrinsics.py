@@ -58,7 +58,31 @@ if used < 8:
     raise SystemExit(f"Только {used} валидных кадров — мало для устойчивой калибровки, "
                       "нужно от 10-15 под разными углами")
 
-rms, mtx, dist, _, _ = cv2.calibrateCamera(objpoints, imgpoints, size, None, None)
+rms, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(objpoints, imgpoints, size, None, None)
+
+# Смазанный или частично закрытый кадр не портит калибровку целиком, но
+# тянет общий RMS вверх и портит cx/cy — отбрасываем худшие по личной ошибке
+# репроекции и считаем заново на оставшихся, вместо новой пересъёмки.
+if used >= 16:
+    per_view_err = []
+    for i in range(used):
+        proj, _ = cv2.projectPoints(objpoints[i], rvecs[i], tvecs[i], mtx, dist)
+        err = cv2.norm(imgpoints[i], proj, cv2.NORM_L2) / len(proj) ** 0.5
+        per_view_err.append(err)
+
+    median_err = sorted(per_view_err)[len(per_view_err) // 2]
+    keep_thresh = max(median_err * 2.5, 1.0)
+    kept_obj = [o for o, e in zip(objpoints, per_view_err) if e <= keep_thresh]
+    kept_img = [p for p, e in zip(imgpoints, per_view_err) if e <= keep_thresh]
+    dropped = used - len(kept_obj)
+
+    if dropped and len(kept_obj) >= 8:
+        rms2, mtx2, dist2, _, _ = cv2.calibrateCamera(kept_obj, kept_img, size, None, None)
+        print(f"Отброшено {dropped} смазанных/шумных кадров из {used} "
+              f"(порог {keep_thresh:.2f}px, медиана {median_err:.2f}px)")
+        print(f"RMS до отсева: {rms:.3f}px -> после: {rms2:.3f}px")
+        rms, mtx, dist = rms2, mtx2, dist2
+        used = len(kept_obj)
 
 fx, fy = mtx[0, 0], mtx[1, 1]
 cx, cy = mtx[0, 2], mtx[1, 2]
