@@ -64,39 +64,49 @@ def cap_log_file(path, max_bytes):
         print(f"[LogCap] Не удалось обрезать {path}: {e}")
 
 
-def switch_bt_profile(profile, verify_timeout=3.0):
+def switch_bt_profile(profile, verify_timeout=3.0, retries=1):
     """Переключает профиль и дожидается, пока Pulse подтвердит переход, а не
     угадывает время фиксированным sleep. pactl возвращается сразу после того,
-    как поставил команду в очередь — согласование HFP/SCO с самой гарнитурой
-    может занять дольше, и раньше начало фразы пользователя (например "да")
-    терялось, пока микрофон ещё не был готов."""
+    как поставил команду в очередь — согласование HFP/SCO (или повторное
+    согласование A2DP при переключении назад) с самой гарнитурой может занять
+    дольше и не всегда укладывается с первой попытки — тогда следующая фраза
+    молча проигрывается ещё в старом, неподходящем профиле (например, TTS
+    после возврата в A2DP звучит в оставшемся HFP-режиме — 16кГц моно вместо
+    44кГц стерео, отсюда заметно "грязный" звук). Поэтому при неудаче команда
+    переключения переиздаётся ещё раз (retries), а не просто отдаётся один раз
+    в надежде на удачу."""
     custom_env = os.environ.copy()
     custom_env["PULSE_RUNTIME_PATH"] = "/run/user/0/pulse"
-    try:
-        subprocess.run(
-            ["pactl", "set-card-profile", BT_CARD, profile],
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env=custom_env
-        )
-    except Exception as e:
-        print(f"[BT Error] Не удалось переключить профиль: {e}")
-        return False
 
-    deadline = time.time() + verify_timeout
-    while time.time() < deadline:
+    for attempt in range(retries + 1):
         try:
-            out = subprocess.run(
-                ["pactl", "list", "cards"], capture_output=True, text=True,
+            subprocess.run(
+                ["pactl", "set-card-profile", BT_CARD, profile],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 env=custom_env
-            ).stdout
-        except Exception:
-            break
-        idx = out.find(BT_CARD)
-        if idx != -1 and f"Active Profile: {profile}" in out[idx:idx + 2000]:
-            return True
-        time.sleep(0.1)
+            )
+        except Exception as e:
+            print(f"[BT Error] Не удалось переключить профиль: {e}")
+            return False
 
-    print(f"[BT Error] Профиль {profile} не подтверждён за {verify_timeout}с — продолжаю без гарантии готовности микрофона.")
+        deadline = time.time() + verify_timeout
+        while time.time() < deadline:
+            try:
+                out = subprocess.run(
+                    ["pactl", "list", "cards"], capture_output=True, text=True,
+                    env=custom_env
+                ).stdout
+            except Exception:
+                break
+            idx = out.find(BT_CARD)
+            if idx != -1 and f"Active Profile: {profile}" in out[idx:idx + 2000]:
+                return True
+            time.sleep(0.1)
+
+        if attempt < retries:
+            print(f"[BT Error] Профиль {profile} не подтверждён за {verify_timeout}с — повторяю попытку.")
+
+    print(f"[BT Error] Профиль {profile} не подтверждён после {retries + 1} попыток — продолжаю без гарантии готовности звука.")
     return False
 
 
@@ -107,11 +117,11 @@ def play_ready_tone():
     тот же flock/AUDIO_LOCK_PATH, что и speak(), чтобы не наложиться на
     предупреждения об опасности из C++ ядра."""
     inner = (
-        'ffmpeg -loglevel quiet -f lavfi -i "sine=frequency=740:duration=0.08" '
-        '-f lavfi -i "sine=frequency=1050:duration=0.10" '
-        '-filter_complex "[0:a][1:a]concat=n=2:v=0:a=1,volume=0.35" '
+        'ffmpeg -loglevel quiet -f lavfi -i "sine=frequency=740:duration=0.09" '
+        '-f lavfi -i "sine=frequency=1050:duration=0.13" '
+        '-filter_complex "[0:a][1:a]concat=n=2:v=0:a=1,volume=0.7" '
         '-ar 22050 -ac 1 -f s16le - | '
-        'aplay -D default -r 22050 -f S16_LE -t raw -c 1 2>/dev/null'
+        'aplay -D default -r 22050 -f S16_LE -t raw -c 1'
     )
     custom_env = os.environ.copy()
     custom_env["PULSE_RUNTIME_PATH"] = "/run/user/0/pulse"
