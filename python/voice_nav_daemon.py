@@ -22,6 +22,12 @@ PIPER_PATH = "/root/diplom-cpp/piper/piper/piper"
 PIPER_MODEL = "/root/diplom-cpp/piper/ru_RU-irina-medium.onnx"
 VOSK_MODEL_PATH = "/root/diplom-cpp/blind_nav/vosk/model"
 BT_CARD = "bluez_card.1C_6E_4C_89_E9_32"
+# PulseAudio-громкость HFP-синка (100%) не гарантирует реальную громкость на
+# самой гарнитуре — HFP обычно синхронизируется с "громкостью звонка" через
+# AT-команды, у которой на устройстве часто свой, независимый от медиа,
+# уровень. Поднимаем программно выше 100%, чтобы не упереться в тихий
+# аппаратный уровень гарнитуры.
+BT_SINK_HFP = f"bluez_sink.{BT_CARD.split('.', 1)[1]}.handsfree_head_unit"
 SOCKET_PORT = 9999
 
 # Общая блокировка звукового устройства с C++ ядром (main.cpp), чтобы
@@ -136,6 +142,10 @@ def play_ready_tone():
     )
     custom_env = os.environ.copy()
     custom_env["PULSE_RUNTIME_PATH"] = "/run/user/0/pulse"
+    subprocess.run(
+        ["pactl", "set-sink-volume", BT_SINK_HFP, "150%"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=custom_env
+    )
     subprocess.run(["flock", AUDIO_LOCK_PATH, "-c", inner], env=custom_env)
 
 
