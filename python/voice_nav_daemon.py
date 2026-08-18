@@ -131,14 +131,20 @@ def play_ready_tone():
     воспроизведения, а физически ничего не звучало. Тишина внутри потока (а не
     sleep перед запуском отдельного процесса) даёт устройству воспроизведения
     непрерывный поток данных с самого открытия, без непредсказуемой задержки
-    на повторный запуск ffmpeg/aplay после паузы."""
+    на повторный запуск ffmpeg/aplay после паузы.
+
+    Частота дискретизации — 16000Гц, как у самого HFP-синка (mSBC, см.
+    `pactl list sinks`), а не 22050 как у speak()/ffmpeg по умолчанию: на
+    рассинхронизации частот (запрошенные 22050 передискретизируются в родные
+    16000 буквально на 200мс клипе) живой тест дал не тон, а шум/треск —
+    отдаём сразу в родном формате синка, без пересчёта на лету."""
     inner = (
-        'ffmpeg -loglevel quiet -f lavfi -i "anullsrc=r=22050:cl=mono:d=0.35" '
+        'ffmpeg -loglevel quiet -f lavfi -i "anullsrc=r=16000:cl=mono:d=0.35" '
         '-f lavfi -i "sine=frequency=740:duration=0.09" '
         '-f lavfi -i "sine=frequency=1050:duration=0.13" '
         '-filter_complex "[0:a][1:a][2:a]concat=n=3:v=0:a=1,volume=0.7" '
-        '-ar 22050 -ac 1 -f s16le - | '
-        'aplay -D default -r 22050 -f S16_LE -t raw -c 1'
+        '-ar 16000 -ac 1 -f s16le - | '
+        'aplay -D default -r 16000 -f S16_LE -t raw -c 1'
     )
     custom_env = os.environ.copy()
     custom_env["PULSE_RUNTIME_PATH"] = "/run/user/0/pulse"
