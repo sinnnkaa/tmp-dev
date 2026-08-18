@@ -590,7 +590,13 @@ int main(int argc, char** argv) {
 
         std::chrono::duration<float> elapsed_since_speech = current_time_sync - last_spoken_state.timestamp;
 
-        if (!is_navigating && max_danger > 0) {
+        // Раньше здесь стояла проверка !is_navigating — предупреждения об
+        // опасности полностью подавлялись на время GPS-навигации. По
+        // техзаданию это неверно: предупреждение об опасности должно звучать
+        // всегда и иметь абсолютный приоритет над голосом маршрута, обрывая
+        // уже звучащую навигационную подсказку (см. pkill ниже), а не
+        // ожидая её окончания или подавляясь вовсе.
+        if (max_danger > 0) {
             bool should_speak = false;
 
             if (best_class_id != last_spoken_state.class_id || best_sector != last_spoken_state.sector) {
@@ -607,11 +613,17 @@ int main(int argc, char** argv) {
                 int dist_m = static_cast<int>(best_distance + 0.5f);
                 std::string text = get_class_name_ru(best_class_id) + " " + best_sector + ", " + std::to_string(dist_m) + " " + get_plural_meters(dist_m);
 
-                // Проигрывание идёт через flock на общий с nav_daemon.service лок-файл,
-                // чтобы предупреждение об опасности и голос маршрута не звучали одновременно;
+                // Предупреждение об опасности имеет абсолютный приоритет над
+                // голосом маршрута: сначала обрываем любую уже звучащую
+                // фразу (aplay навигационной подсказки, если она есть),
+                // затем захватываем общий с nav_daemon.service flock-лок —
+                // так подсказка маршрута не звучит поверх предупреждения и
+                // не заставляет его ждать. Голос маршрута (Python, speak())
+                // симметрично никого не обрывает — только ждёт лок, поэтому
+                // приоритет всегда у предупреждения об опасности.
                 // guard перед echo ограничивает рост system_audio.raw.
                 std::string audio_log(AUDIO_LOG_PATH);
-                std::string command = std::string("flock ") + AUDIO_LOCK_PATH + " -c '"
+                std::string command = std::string("pkill -f 'aplay -D default -r 22050' >/dev/null 2>&1; flock ") + AUDIO_LOCK_PATH + " -c '"
                     "[ -f " + audio_log + " ] && [ $(stat -c%s " + audio_log + ") -gt " +
                     std::to_string(AUDIO_LOG_MAX_BYTES) + " ] && : > " + audio_log + "; "
                     "echo \"" + text + "\" | /root/diplom-cpp/piper/piper/piper "
