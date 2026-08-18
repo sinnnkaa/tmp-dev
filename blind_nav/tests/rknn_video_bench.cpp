@@ -21,7 +21,7 @@ namespace {
 
 constexpr int INPUT_SIZE = 512;
 constexpr float CONF_THRESHOLD = 0.30f;
-constexpr float FOCAL_LENGTH = 252.0f;  // как в main.cpp — прикидка из даташита, не откалибровано (см. CALIBRATION.md)
+constexpr float FOCAL_LENGTH = 761.5f;  // как в main.cpp — измерено калибровкой по чек-борду (см. CALIBRATION.md)
 
 struct Accum {
     double sum = 0.0;
