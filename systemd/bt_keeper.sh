@@ -20,6 +20,35 @@ connected() {
     bluetoothctl info "$MAC" 2>/dev/null | grep -q "Connected: yes"
 }
 
+tune_audio_server() {
+    # Две настройки сервера, которые нельзя задать из voice_nav_daemon.py:
+    # они относятся к загруженным модулям, а не к отдельному воспроизведению.
+
+    # 1. module-bluetooth-policy идёт из /etc/pulse/default.pa с дефолтным
+    #    auto_switch=1 и сам переключает профиль карты, когда на bluez-источнике
+    #    появляется или исчезает записывающий поток. Демон переключает профиль
+    #    вручную и дожидается подтверждения (switch_bt_profile), после чего
+    #    политика могла увести карту обратно в A2DP — отсюда наблюдавшееся
+    #    "a2dp иногда звучит как hfp" и срабатывание сигнала через раз.
+    #    Переключение остаётся ровно одно, явное, из демона.
+    if pactl unload-module module-bluetooth-policy 2>/dev/null; then
+        pactl load-module module-bluetooth-policy auto_switch=false >/dev/null 2>&1 \
+            && echo "[BT Keeper] module-bluetooth-policy: auto_switch=false" \
+            || echo "[BT Keeper] ВНИМАНИЕ: module-bluetooth-policy не поднялся обратно."
+    fi
+
+    # 2. module-suspend-on-idle усыпляет синк через несколько секунд тишины.
+    #    Пробуждение BT-линка (особенно свежего SCO в HFP) стоит секунду-две, и
+    #    ровно в неё проваливалось начало фразы: aplay рапортовал успешный старт,
+    #    а физически не звучало ничего. В play_ready_tone это обходилось секундой
+    #    тишины-разгона перед сигналом — лечение симптома. Без модуля синк не
+    #    засыпает вовсе, линк остаётся тёплым, начало фраз не режется.
+    #    Цена — гарнитура постоянно принимает поток и садится быстрее; для
+    #    носимого устройства на съёмках это приемлемый размен.
+    pactl unload-module module-suspend-on-idle 2>/dev/null \
+        && echo "[BT Keeper] module-suspend-on-idle выгружен (звук не засыпает)."
+}
+
 start_audio_server() {
     echo "[BT Keeper] Аудиосервер не отвечает — запускаю..."
     killall pulseaudio 2>/dev/null
@@ -47,6 +76,7 @@ start_audio_server() {
         # Обычно модули уже подняты из default.pa — тогда pactl откажется и это
         # нормально. Вызов нужен для случая, когда default.pa их не завёл.
         pactl load-module module-bluetooth-discover 2>/dev/null
+        tune_audio_server
         return 0
     fi
 
@@ -57,6 +87,11 @@ start_audio_server() {
 retry_delay=$RETRY_MIN_SEC
 next_attempt=0
 state=""
+
+# Сервер мог пережить перезапуск самого keeper'а (Restart=always) — тогда
+# start_audio_server ниже не вызовется и настройки модулей не применятся.
+# Применяем их к уже живому серверу: обе операции идемпотентны.
+audio_alive && tune_audio_server
 
 echo "[BT Keeper] Вход в цикл мониторинга..."
 while true; do

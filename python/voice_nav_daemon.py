@@ -22,12 +22,6 @@ PIPER_PATH = "/root/diplom-cpp/piper/piper/piper"
 PIPER_MODEL = "/root/diplom-cpp/piper/ru_RU-irina-medium.onnx"
 VOSK_MODEL_PATH = "/root/diplom-cpp/blind_nav/vosk/model"
 BT_CARD = "bluez_card.1C_6E_4C_89_E9_32"
-# PulseAudio-громкость HFP-синка (100%) не гарантирует реальную громкость на
-# самой гарнитуре — HFP обычно синхронизируется с "громкостью звонка" через
-# AT-команды, у которой на устройстве часто свой, независимый от медиа,
-# уровень. Поднимаем программно выше 100%, чтобы не упереться в тихий
-# аппаратный уровень гарнитуры.
-BT_SINK_HFP = f"bluez_sink.{BT_CARD.split('.', 1)[1]}.handsfree_head_unit"
 SOCKET_PORT = 9999
 
 # Общая блокировка звукового устройства с C++ ядром (main.cpp), чтобы
@@ -70,6 +64,107 @@ def cap_log_file(path, max_bytes):
         print(f"[LogCap] Не удалось обрезать {path}: {e}")
 
 
+def pulse_env():
+    """Окружение для любого обращения к PulseAudio.
+
+    Сервер поднимается из bt_keeper.sh под root и кладёт сокет в
+    /run/user/0/pulse. У systemd-юнита nav_daemon.service своего
+    XDG_RUNTIME_DIR нет, поэтому путь задаётся явно — иначе pactl/aplay/ffmpeg
+    не находят сервер и молча уходят в сырой ALSA мимо наушников.
+    """
+    env = os.environ.copy()
+    env["PULSE_RUNTIME_PATH"] = "/run/user/0/pulse"
+    return env
+
+
+def bt_device_name(kind):
+    """Фактическое имя bluez-устройства (kind: "sink" или "source") или None.
+
+    Имя не собирается из BT_CARD руками, а спрашивается у сервера: оно зависит
+    от активного профиля (`bluez_sink.MAC.a2dp_sink` против
+    `bluez_sink.MAC.handsfree_head_unit`), а в HFP появляется ещё и
+    `bluez_source.MAC.handsfree_head_unit`, которого в A2DP не существует
+    вовсе. Обращение по вычисленному "на бумаге" имени — как в прежнем
+    BT_SINK_HFP — тихо промахивается мимо реального устройства.
+    """
+    try:
+        out = subprocess.run(
+            ["pactl", "list", f"{kind}s", "short"],
+            capture_output=True, text=True, env=pulse_env()
+        ).stdout
+    except Exception:
+        return None
+
+    prefix = f"bluez_{kind}."
+    for line in out.splitlines():
+        fields = line.split("\t")
+        if len(fields) > 1 and fields[1].startswith(prefix):
+            return fields[1]
+    return None
+
+
+def playback_device():
+    """Аргумент -D для aplay: конкретный bluez-синк, а не "default".
+
+    Это ключевая правка. `aplay -D default` уходит в alsa-плагин pulse и
+    играет в *default sink* сервера, а тот на этой плате не гарантированно
+    указывает на наушники: в /root/.config/pulse/*-default-sink записан
+    встроенный кодек `alsa_output.platform-rk809-sound.stereo-fallback`, и
+    module-default-device-restore возвращает его при каждом старте сервера.
+    Хуже того, set-card-profile уничтожает синк старого профиля и создаёт
+    новый, так что указатель default переставляется на каждом переключении
+    A2DP<->HFP и вполне успевает сползти обратно на плату. Отсюда живой
+    симптом "сигнал слышно через раз" — половина попыток физически звучала в
+    динамик платы, а не в гарнитуру.
+
+    Если гарнитуры нет (не подключена, севшая батарея), остаётся "default" —
+    тогда звук идёт хоть куда-то, а не пропадает совсем.
+    """
+    sink = bt_device_name("sink")
+    return f"pulse:{sink}" if sink else "default"
+
+
+def capture_device():
+    """Имя источника для `ffmpeg -f pulse -i ...` — bluez-микрофон, не "default".
+
+    Та же болезнь с другой стороны: default source на этой плате —
+    `alsa_input...Webcam...` (микрофон USB-вебкамеры). Пока указатель default
+    не переставился на гарнитуру, распознавание речи слушало вебкамеру,
+    висящую на груди, а переключение в HFP на захват вообще не влияло.
+    """
+    source = bt_device_name("source")
+    return source if source else "default"
+
+
+def bind_defaults_to_bt():
+    """Прибивает default sink/source сервера к гарнитуре после смены профиля.
+
+    Нужно не для самого демона (он адресуется по имени, см. playback_device),
+    а для C++ ядра: предупреждения об опасности в main.cpp играются через
+    `aplay -D default` из std::system и имени синка не знают. Без этого вызова
+    они уходят туда же, куда уполз default — в динамик платы.
+    """
+    env = pulse_env()
+    for kind, setter in (("sink", "set-default-sink"), ("source", "set-default-source")):
+        name = bt_device_name(kind)
+        if not name:
+            continue
+        subprocess.run(
+            ["pactl", setter, name],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env
+        )
+
+    # Снимаем засыпание с синка немедленно: module-suspend-on-idle усыпляет
+    # устройство через несколько секунд простоя, а пробуждение BT-линка стоит
+    # секунду-другую, в течение которой начало фразы физически не звучит.
+    sink = bt_device_name("sink")
+    if sink:
+        subprocess.run(
+            ["pactl", "suspend-sink", sink, "0"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env
+        )
+
+
 def switch_bt_profile(profile, verify_timeout=3.0, retries=1):
     """Переключает профиль и дожидается, пока Pulse подтвердит переход, а не
     угадывает время фиксированным sleep. pactl возвращается сразу после того,
@@ -80,9 +175,17 @@ def switch_bt_profile(profile, verify_timeout=3.0, retries=1):
     после возврата в A2DP звучит в оставшемся HFP-режиме — 16кГц моно вместо
     44кГц стерео, отсюда заметно "грязный" звук). Поэтому при неудаче команда
     переключения переиздаётся ещё раз (retries), а не просто отдаётся один раз
-    в надежде на удачу."""
-    custom_env = os.environ.copy()
-    custom_env["PULSE_RUNTIME_PATH"] = "/run/user/0/pulse"
+    в надежде на удачу.
+
+    Отдельно: module-bluetooth-policy (загружен из /etc/pulse/default.pa)
+    по умолчанию идёт с auto_switch=1 и сам дёргает профиль карты по
+    появлению/исчезновению записывающего потока на bluez-источнике. Он
+    конкурирует с этим ручным переключением и может увести карту обратно в
+    A2DP уже после того, как здесь профиль подтверждён — это второй источник
+    симптома "a2dp звучит как hfp". Политика выключается в bt_keeper.sh
+    (auto_switch=false), потому что живёт она на стороне сервера, а не
+    демона."""
+    custom_env = pulse_env()
 
     for attempt in range(retries + 1):
         try:
@@ -106,6 +209,7 @@ def switch_bt_profile(profile, verify_timeout=3.0, retries=1):
                 break
             idx = out.find(BT_CARD)
             if idx != -1 and f"Active Profile: {profile}" in out[idx:idx + 2000]:
+                bind_defaults_to_bt()
                 return True
             time.sleep(0.1)
 
@@ -144,27 +248,29 @@ def play_ready_tone():
     отдаём сразу в родном формате синка, без пересчёта на лету.
 
     Громкость: `pactl set-sink-volume 150%` из предыдущей правки не дал
-    заметного эффекта на живом тесте ("тихий") — у bluez5 native HFP-бэкенда
-    громкость синка обычно транслируется напрямую в аппаратные шаги
-    AT+VGS гарнитуры (без программного усиления поверх), так что запрос
-    громкости выше 100% скорее всего просто обрезается по максимальному
-    шагу, а не даёт лишний запас. Реальный доступный запас — амплитуда самого
-    сигнала: синус пилится на пик 1.0, предыдущий gain 0.7 оставлял на столе
-    ~3дБ громкости без риска клиппинга — поднят до 1.0."""
+    заметного эффекта на живом тесте ("тихий"). Настоящая причина, скорее
+    всего, была не в шагах AT+VGS гарнитуры, а в том, что громкость крутилась
+    у синка, собранного из BT_CARD "на бумаге", тогда как звук в этот момент
+    мог играть совсем в другое устройство (см. playback_device). Теперь и
+    громкость, и воспроизведение адресуются одному и тому же фактическому
+    синку. Амплитуда сигнала оставлена на 1.0 (пик без клиппинга)."""
+    device = playback_device()
     inner = (
         'ffmpeg -loglevel quiet -f lavfi -i "anullsrc=r=16000:cl=mono:d=1.0" '
         '-f lavfi -i "sine=frequency=740:duration=0.09" '
         '-f lavfi -i "sine=frequency=1050:duration=0.13" '
         '-filter_complex "[0:a][1:a][2:a]concat=n=3:v=0:a=1,volume=1.0" '
         '-ar 16000 -ac 1 -f s16le - | '
-        'aplay -D default -r 16000 -f S16_LE -t raw -c 1'
+        f'aplay -D {device} -r 16000 -f S16_LE -t raw -c 1'
     )
-    custom_env = os.environ.copy()
-    custom_env["PULSE_RUNTIME_PATH"] = "/run/user/0/pulse"
-    subprocess.run(
-        ["pactl", "set-sink-volume", BT_SINK_HFP, "150%"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=custom_env
-    )
+    custom_env = pulse_env()
+    sink = bt_device_name("sink")
+    if sink:
+        subprocess.run(
+            ["pactl", "set-sink-volume", sink, "100%"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=custom_env
+        )
+    print(f"[Сигнал] Устройство воспроизведения: {device}")
     subprocess.run(["flock", AUDIO_LOCK_PATH, "-c", inner], env=custom_env)
 
 
@@ -176,11 +282,10 @@ def speak(text, sync=False):
         f'echo {safe_text} | '
         f'{PIPER_PATH} --model {PIPER_MODEL} --length_scale 0.85 --output-raw | '
         f'tee -a {AUDIO_LOG_PATH} | '
-        f'aplay -D default -r 22050 -f S16_LE -t raw -c 1 2>/dev/null'
+        f'aplay -D {playback_device()} -r 22050 -f S16_LE -t raw -c 1 2>/dev/null'
     )
 
-    custom_env = os.environ.copy()
-    custom_env["PULSE_RUNTIME_PATH"] = "/run/user/0/pulse"
+    custom_env = pulse_env()
 
     # Аргументы передаются списком (а не одной shell-строкой), чтобы safe_text
     # не ломался при повторном оборачивании во flock -c '...'.
@@ -276,11 +381,12 @@ def listen_and_transcribe(model, seconds):
     cap_log_file(MIC_LOG_PATH, MIC_LOG_MAX_BYTES)
 
     rec = KaldiRecognizer(model, 16000)
-    cmd = ['ffmpeg', '-loglevel', 'quiet', '-f', 'pulse', '-i', 'default',
+    source = capture_device()
+    print(f"[STT] Источник записи: {source}")
+    cmd = ['ffmpeg', '-loglevel', 'quiet', '-f', 'pulse', '-i', source,
            '-ar', '16000', '-ac', '1', '-f', 's16le', '-t', str(seconds), '-']
 
-    custom_env = os.environ.copy()
-    custom_env["PULSE_RUNTIME_PATH"] = "/run/user/0/pulse"
+    custom_env = pulse_env()
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, env=custom_env)
 
     text = ""

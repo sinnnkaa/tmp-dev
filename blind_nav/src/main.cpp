@@ -625,7 +625,15 @@ int main(int argc, char** argv) {
                 // приоритет всегда у предупреждения об опасности.
                 // guard перед echo ограничивает рост system_audio.raw.
                 std::string audio_log(AUDIO_LOG_PATH);
-                std::string command = std::string("pkill -f 'aplay -D default -r 22050' >/dev/null 2>&1; flock ") + AUDIO_LOCK_PATH + " -c '"
+                // Шаблон pkill намеренно не привязан к "-D default": голос
+                // маршрута (voice_nav_daemon.py, speak()) адресуется
+                // конкретному bluez-синку ("-D pulse:bluez_sink.<MAC>.<профиль>"),
+                // потому что указатель default у PulseAudio на этой плате
+                // сползает на встроенный кодек при каждой смене BT-профиля.
+                // Прежний дословный шаблон после этой правки перестал бы
+                // находить процесс, и предупреждение об опасности молча
+                // потеряло бы право обрывать навигационную подсказку.
+                std::string command = std::string("pkill -f 'aplay -D [^ ]+ -r 22050' >/dev/null 2>&1; flock ") + AUDIO_LOCK_PATH + " -c '"
                     "[ -f " + audio_log + " ] && [ $(stat -c%s " + audio_log + ") -gt " +
                     std::to_string(AUDIO_LOG_MAX_BYTES) + " ] && : > " + audio_log + "; "
                     "echo \"" + text + "\" | /root/diplom-cpp/piper/piper/piper "
