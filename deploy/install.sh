@@ -41,7 +41,7 @@ echo "==> systemctl daemon-reload"
 systemctl daemon-reload
 
 echo "==> Включаю автозапуск сервисов (без старта прямо сейчас)"
-systemctl enable bt_keeper.service nav_daemon.service blind_nav_main.service osrm.service
+systemctl enable bt_keeper.service nav_daemon.service blind_nav_main.service osrm.service nav_record.service
 
 cat <<'EOF'
 
@@ -53,7 +53,7 @@ cat <<'EOF'
   3. Проверить камеру, микрофон/наушники, GPS.
   4. Поставить Docker (нужен для osrm.service) — см. deploy/osrm/README.md.
   5. Запустить сервисы:
-       systemctl start osrm.service bt_keeper.service nav_daemon.service blind_nav_main.service
+       systemctl start osrm.service bt_keeper.service nav_daemon.service blind_nav_main.service nav_record.service
 
 См. TESTING.md — чек-лист ручной проверки на плате.
 EOF

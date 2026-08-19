@@ -16,6 +16,8 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <ctime>
 #include <opencv2/opencv.hpp>
 #include "rknn_inference.h"
 #include "decode.h"
@@ -45,8 +47,12 @@ const char* MIC_OPEN_PATH = "/dev/shm/nav_mic_open";
 // чтобы предупреждения об опасности и голосовые инструкции маршрута не звучали
 // одновременно поверх друг друга.
 const char* AUDIO_LOCK_PATH = "/run/lock/blind_nav_audio.lock";
-const char* AUDIO_LOG_PATH = "/root/diplom-cpp/system_audio.raw";
-const long AUDIO_LOG_MAX_BYTES = 20L * 1024 * 1024;
+
+// Единый синтез+воспроизведение фразы. Раньше конвейер piper|aplay был
+// выписан здесь строкой для std::system и второй раз в voice_nav_daemon.py;
+// теперь обе стороны зовут один скрипт, и он же сохраняет реплику с меткой
+// времени для автомонтажа ролика (tools/montage_session.sh).
+const char* SAY_SCRIPT = "/root/diplom-cpp/tools/say.sh";
 
 // Квантованная модель: 25.3 FPS против 10.6 у прежней FP16-версии при падении
 // полноты в опасной зоне на 2% по машинам и 5% по людям (замеры — METRICS.md).
@@ -54,12 +60,29 @@ const long AUDIO_LOG_MAX_BYTES = 20L * 1024 * 1024;
 // поменять путь здесь и пересобрать, формат выходов у моделей одинаковый.
 const char* MODEL_PATH = "/root/diplom-cpp/blind_nav/model/yolo11_int8.rknn";
 
-const char* VIDEO_PATH_A = "/root/diplom-cpp/output_video_a.avi";
-const char* VIDEO_PATH_B = "/root/diplom-cpp/output_video_b.avi";
-// Потолок записи — 500 МБ суммарно, поэтому на каждый из двух файлов кольца
-// приходится половина. При 90 МБ/час это около пяти с половиной часов истории.
-const long VIDEO_TOTAL_MAX_BYTES = 500L * 1024 * 1024;
-const long VIDEO_MAX_BYTES = VIDEO_TOTAL_MAX_BYTES / 2;
+// Каталог записей прогулок. Внутри на каждый отрезок записи заводится:
+//   capture_<тег>.avi      — кадры с рамками, MJPG (пишет этот процесс)
+//   session_<тег>.meta     — начало, конец, число кадров и реальный FPS
+//   speech_<тег>/          — реплики piper с метками времени (пишет say.sh)
+//   micro_sound_<тег>.mp3  — непрерывный микрофон (пишет record_session.sh)
+// Из них tools/montage_session.sh собирает full_video_<тег>.mp4.
+const char* VIDEO_DIR = "/root/diplom-cpp/videos";
+
+// Тег текущего отрезка записи. Через этот файл say.sh (а значит и python-демон)
+// узнаёт, в какой каталог складывать реплики, не договариваясь с этим
+// процессом напрямую. Пусто — запись не идёт.
+const char* SESSION_TAG_PATH = "/dev/shm/nav_session";
+
+// Потолок одного файла. Раньше здесь было кольцо из двух файлов по 250 МБ,
+// затиравшее историю; теперь по достижении потолка начинается следующий
+// отрезок, а прежний остаётся целиком — он нужен для монтажа.
+const long VIDEO_SEGMENT_MAX_BYTES = 500L * 1024 * 1024;
+
+// Ниже этого запаса запись прекращается. Забитый под ноль корневой раздел на
+// этой плате означает не "нет нового видео", а неработающее устройство:
+// перестают писаться и tmpfs-флаги, и журналы, и лог озвучки. Видео —
+// вспомогательная функция, она обязана уступить первой.
+const long VIDEO_MIN_FREE_BYTES = 2L * 1024 * 1024 * 1024;
 
 std::atomic<bool> is_navigating(false);
 std::atomic<bool> keep_running(true);
@@ -94,45 +117,158 @@ std::mutex render_mutex;
 // Трекинг и история озвучки инкапсулированы в NavPipeline (pipeline.h).
 NavPipeline pipeline;
 
-// Пишет кадры в output_video_{a,b}.avi по кругу: как только текущий файл
-// превышает VIDEO_MAX_BYTES, запись переключается на второй файл и затирает
-// его содержимое. Только что заполненный файл остаётся на диске — он и есть
-// сохранённая история. Суммарный размер ограничен двумя файлами.
-class VideoRotator {
+// Вспомогательные функции записи прогулки.
+static std::string date_tag() {
+    time_t t = time(nullptr);
+    struct tm tm_buf;
+    localtime_r(&t, &tm_buf);
+    char buf[32];
+    strftime(buf, sizeof(buf), "%d_%m_%Y", &tm_buf);
+    return std::string(buf);
+}
+
+static double epoch_now() {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) / 1e9;
+}
+
+static bool path_exists(const std::string& path) {
+    struct stat st;
+    return stat(path.c_str(), &st) == 0;
+}
+
+static long long free_bytes(const char* dir) {
+    struct statvfs vfs;
+    if (statvfs(dir, &vfs) != 0) return -1;
+    return static_cast<long long>(vfs.f_bavail) * static_cast<long long>(vfs.f_frsize);
+}
+
+// Пишет кадры с рамками в videos/capture_<тег>.avi. По достижении
+// VIDEO_SEGMENT_MAX_BYTES закрывает отрезок и начинает следующий — прежний
+// файл остаётся целиком, из него потом собирается ролик.
+//
+// Тег — дата в формате ДД_ММ_ГГГГ; если запись за этот день уже есть, к тегу
+// добавляется номер (19_08_2026_2), иначе второй прогон дня затёр бы первый.
+class SessionRecorder {
 public:
     void write(const cv::Mat& frame) {
-        if (!writer.isOpened()) {
-            open_new();
-        }
-        if (writer.isOpened()) {
-            writer.write(frame);
+        if (stopped_) return;
+        if (!writer_.isOpened() && !open_new()) {
+            stopped_ = true;
+            return;
         }
 
+        writer_.write(frame);
+        frames_++;
+
+        // Проверки раз в ~секунду, а не на каждом кадре: stat/statvfs на
+        // SD-карте стоят заметно дороже самой записи кадра.
+        if (frames_ % 30 != 0) return;
+
         struct stat st;
-        if (stat(current_path(), &st) == 0 && st.st_size > VIDEO_MAX_BYTES) {
-            use_a = !use_a;
-            open_new();
+        if (stat(capture_path_.c_str(), &st) == 0 && st.st_size > VIDEO_SEGMENT_MAX_BYTES) {
+            std::cerr << "[Запись] Отрезок " << tag_ << " заполнен, начинаю следующий." << std::endl;
+            finalize();
+            if (!open_new()) stopped_ = true;
+            return;
         }
+
+        long long avail = free_bytes(VIDEO_DIR);
+        if (avail >= 0 && avail < VIDEO_MIN_FREE_BYTES) {
+            std::cerr << "[Запись] Осталось меньше " << (VIDEO_MIN_FREE_BYTES >> 20)
+                      << " МБ на разделе — останавливаю запись видео, чтобы не забить карту."
+                      << std::endl;
+            finalize();
+            stopped_ = true;
+            return;
+        }
+
+        // Раз в ~10 секунд обновляем meta незакрытого отрезка. Если питание
+        // снимут рубильником, финализация не выполнится никогда — и без этой
+        // страховки монтаж не узнал бы ни реального FPS, ни момента старта.
+        if (frames_ % 300 == 0) write_meta(false);
     }
 
     void close() {
-        if (writer.isOpened()) writer.release();
+        if (writer_.isOpened()) finalize();
+        publish_tag("");
     }
 
 private:
-    bool use_a = true;
-    cv::VideoWriter writer;
+    bool stopped_ = false;
+    cv::VideoWriter writer_;
+    std::string tag_;
+    std::string capture_path_;
+    long long frames_ = 0;
+    double start_epoch_ = 0.0;
 
-    const char* current_path() const { return use_a ? VIDEO_PATH_A : VIDEO_PATH_B; }
+    bool open_new() {
+        mkdir(VIDEO_DIR, 0755);
 
-    void open_new() {
-        if (writer.isOpened()) writer.release();
-        // Файл под запись открывается на усечение, поэтому удалять его руками
-        // не нужно. Раньше здесь стоял std::remove(other_path()) — он стирал
-        // не старый файл, а только что дописанный, и после каждого
-        // переключения история обнулялась.
-        writer.open(current_path(), cv::VideoWriter::fourcc('M', 'J', 'P', 'G'), 30.0,
-                    cv::Size(FRAME_WIDTH, FRAME_HEIGHT));
+        std::string base = date_tag();
+        tag_ = base;
+        for (int n = 2; n < 1000; n++) {
+            if (!path_exists(std::string(VIDEO_DIR) + "/capture_" + tag_ + ".avi")) break;
+            tag_ = base + "_" + std::to_string(n);
+        }
+
+        capture_path_ = std::string(VIDEO_DIR) + "/capture_" + tag_ + ".avi";
+        mkdir((std::string(VIDEO_DIR) + "/speech_" + tag_).c_str(), 0755);
+
+        // FPS в заголовке AVI заведомо номинальный: реальный темп камеры
+        // плавает и известен только по факту. Монтаж пересчитывает дорожку по
+        // fps из meta, иначе звук уезжает от картинки тем сильнее, чем длиннее
+        // прогулка.
+        writer_.open(capture_path_, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'), 30.0,
+                     cv::Size(FRAME_WIDTH, FRAME_HEIGHT));
+        if (!writer_.isOpened()) {
+            std::cerr << "[Запись] Не удалось открыть " << capture_path_
+                      << " — запись видео выключена." << std::endl;
+            return false;
+        }
+
+        frames_ = 0;
+        start_epoch_ = epoch_now();
+        write_meta(false);
+        publish_tag(tag_);
+        std::cerr << "[Запись] Пишу " << capture_path_ << std::endl;
+        return true;
+    }
+
+    void finalize() {
+        if (writer_.isOpened()) writer_.release();
+        write_meta(true);
+        std::ofstream done(std::string(VIDEO_DIR) + "/session_" + tag_ + ".done");
+        publish_tag("");
+    }
+
+    void write_meta(bool final_) {
+        double now = epoch_now();
+        double span = now - start_epoch_;
+        double fps = (span > 0.5 && frames_ > 1) ? (frames_ / span) : 30.0;
+
+        std::string path = std::string(VIDEO_DIR) + "/session_" + tag_ + ".meta";
+        std::string tmp = path + ".tmp";
+        {
+            std::ofstream f(tmp);
+            if (!f) return;
+            f << "tag=" << tag_ << "\n"
+              << "capture=capture_" << tag_ << ".avi\n"
+              << "start_epoch=" << std::fixed << start_epoch_ << "\n"
+              << "end_epoch=" << now << "\n"
+              << "frames=" << frames_ << "\n"
+              << "fps=" << fps << "\n"
+              << "final=" << (final_ ? 1 : 0) << "\n";
+        }
+        // Через переименование: обрыв питания посреди записи meta оставил бы
+        // монтажу обрезанный файл вместо предыдущей целой версии.
+        std::rename(tmp.c_str(), path.c_str());
+    }
+
+    void publish_tag(const std::string& tag) {
+        std::ofstream f(SESSION_TAG_PATH, std::ios::trunc);
+        if (f) f << tag;
     }
 };
 
@@ -174,7 +310,7 @@ void camera_thread_func(int camera_index) {
 
     apply_camera_props(cap);
 
-    VideoRotator video_out;
+    SessionRecorder video_out;
     auto last_good_frame = std::chrono::steady_clock::now();
     const float CAMERA_TIMEOUT_SEC = 3.0f;
 
@@ -213,7 +349,7 @@ void camera_thread_func(int camera_index) {
                 cv::putText(temp_frame, shared_timer_text, cv::Point(15, 35), cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 255), 2);
             }
 
-            // 3. Пишем готовый плавный кадр в файл (с ограничением роста, см. VideoRotator)
+            // 3. Пишем готовый плавный кадр в файл (нарезка по отрезкам — см. SessionRecorder)
             video_out.write(temp_frame);
         } else {
             std::chrono::duration<float> since_good = std::chrono::steady_clock::now() - last_good_frame;
@@ -450,22 +586,22 @@ int main(int argc, char** argv) {
         // полностью подавлялись на время GPS-навигации. По техзаданию это
         // неверно: предупреждение об опасности должно звучать всегда.
         if (decision.speak) {
-            // guard перед echo ограничивает рост system_audio.raw.
-            std::string audio_log(AUDIO_LOG_PATH);
-            // Шаблон pkill намеренно не привязан к "-D default": голос
-            // маршрута (voice_nav_daemon.py, speak()) адресуется конкретному
-            // bluez-синку ("-D pulse:bluez_sink.<MAC>.<профиль>"), потому что
-            // указатель default у PulseAudio на этой плате сползает на
-            // встроенный кодек при каждой смене BT-профиля. Прежний дословный
-            // шаблон после той правки перестал бы находить процесс, и
-            // предупреждение молча потеряло бы право обрывать подсказку.
-            std::string command = std::string("pkill -f 'aplay -D [^ ]+ -r 22050' >/dev/null 2>&1; flock ") + AUDIO_LOCK_PATH + " -c '"
-                "[ -f " + audio_log + " ] && [ $(stat -c%s " + audio_log + ") -gt " +
-                std::to_string(AUDIO_LOG_MAX_BYTES) + " ] && : > " + audio_log + "; "
-                "echo \"" + decision.phrase + "\" | /root/diplom-cpp/piper/piper/piper "
-                "--model /root/diplom-cpp/piper/ru_RU-irina-medium.onnx --length_scale 0.85 --output-raw | "
-                "tee -a " + audio_log + " | "
-                "aplay -D default -r 22050 -f S16_LE -t raw -c 1 2>/dev/null' &";
+            // Снятие текущей озвучки перед своей: сначала сам скрипт озвучки
+            // (иначе он дойдёт до aplay уже после того, как мы убьём piper и
+            // фраза всё равно прозвучит), затем синтез, затем воспроизведение.
+            // Голос маршрута (voice_nav_daemon.py) симметрично никого не
+            // обрывает, только ждёт общий flock — поэтому приоритет всегда у
+            // предупреждения об опасности.
+            //
+            // Раньше здесь стояла проверка !is_navigating — предупреждения
+            // полностью подавлялись на время GPS-навигации. По техзаданию это
+            // неверно: предупреждение об опасности должно звучать всегда.
+            std::string command =
+                std::string("pkill -f 'tools/say.sh' >/dev/null 2>&1; ")
+                + "pkill -f 'piper --model' >/dev/null 2>&1; "
+                + "pkill -f 'aplay -D [^ ]+ -r 22050' >/dev/null 2>&1; "
+                + "flock " + AUDIO_LOCK_PATH + " " + SAY_SCRIPT
+                + " \"" + decision.phrase + "\" core &";
             std::system(command.c_str());
         }
 

@@ -1,0 +1,22 @@
+[Unit]
+Description=BlindNav walk recorder (microphone + auto montage)
+# Мягкий порядок, а не зависимость: запись прогулки — вспомогательная функция,
+# и её отказ не должен ронять ни зрение, ни маршруты.
+After=network.target bt_keeper.service blind_nav_main.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Environment="PULSE_RUNTIME_PATH=/run/user/0/pulse"
+ExecStart=/root/diplom-cpp/tools/record_session.sh
+WorkingDirectory=/root/diplom-cpp
+Restart=always
+RestartSec=5
+User=root
+# Ниже зрения и маршрутов: кодирование звука не должно отбирать у них ядра.
+Nice=10
+# Запас на корректное закрытие mp3 и отвязку монтажа.
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

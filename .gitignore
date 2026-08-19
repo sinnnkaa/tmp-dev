@@ -40,3 +40,4 @@ blind_nav/tests/rgb_bug_demo/npu_real/*.avi
 # Результаты оффлайн-прогона видео (tools/replay_video.sh) — десятки МБ на
 # запуск, пересобираются из исходного ролика одной командой.
 replay_out/
+videos/

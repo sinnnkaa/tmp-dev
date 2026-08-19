@@ -5,14 +5,14 @@
 роста в кадре-«пейзаже». Наше устройство смотрит с груди идущего человека
 на 640x480, и именно этот сдвиг домена — главная причина низких метрик
 (METRICS.md). Закрыть его можно только своими кадрами; плата их уже пишет
-сама в output_video_a.avi / output_video_b.avi.
+сама в videos/capture_<тег>.avi (после монтажа — videos/raw_video_<тег>.mp4).
 
 Скрипт вынимает кадры из этих записей и прогоняет по ним большую модель
 (по умолчанию COCO-претрейн yolo11x), раскладывая результат в YOLO-формат.
 Это черновик: его обязательно нужно открыть в разметчике и поправить.
 
     pip install ultralytics
-    python pseudo_label.py --video D:/board_rec/output_video_a.avi \\
+    python pseudo_label.py --video D:/board_rec/raw_video_19_08_2026.mp4 \\
                            --out D:/bn_raw/own --every 15
 
 Важное ограничение: COCO-претрейн умеет только person, car/truck/bus,

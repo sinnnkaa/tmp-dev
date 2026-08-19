@@ -181,7 +181,7 @@ python fetch_open.py --source open-images-v7 --split validation --max-samples 20
 python fetch_open.py --source coco-2017 --split train --max-samples 6000 --out D:/bn_raw/coco_train
 
 # 3. Свои кадры с платы — главное лекарство от сдвига домена
-python pseudo_label.py --video D:/board_rec/output_video_a.avi --out D:/bn_raw/own --every 15
+python pseudo_label.py --video D:/board_rec/raw_video_19_08_2026.mp4 --out D:/bn_raw/own --every 15
 
 # 4. Слить, почистить, порезать
 python prepare.py --src E:/DATASET --src D:/bn_raw/oi_train --src D:/bn_raw/coco_train \

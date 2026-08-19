@@ -8,7 +8,6 @@ import subprocess
 import socket
 import threading
 from vosk import Model, KaldiRecognizer
-import shlex
 
 try:
     import gps
@@ -18,8 +17,6 @@ except ImportError:
 
 ADDRESS_DB_PATH = "/root/diplom-cpp/blind_nav/map/addresses.json"
 OSRM_URL = "http://127.0.0.1:5000/route/v1/foot/"
-PIPER_PATH = "/root/diplom-cpp/piper/piper/piper"
-PIPER_MODEL = "/root/diplom-cpp/piper/ru_RU-irina-medium.onnx"
 VOSK_MODEL_PATH = "/root/diplom-cpp/blind_nav/vosk/model"
 BT_CARD = "bluez_card.1C_6E_4C_89_E9_32"
 SOCKET_PORT = 9999
@@ -28,8 +25,10 @@ SOCKET_PORT = 9999
 # предупреждения об опасности и голосовые инструкции маршрута не звучали
 # одновременно поверх друг друга.
 AUDIO_LOCK_PATH = "/run/lock/blind_nav_audio.lock"
-AUDIO_LOG_PATH = "/root/diplom-cpp/system_audio.raw"
-AUDIO_LOG_MAX_BYTES = 20 * 1024 * 1024
+
+# Общий с C++ ядром скрипт озвучки: синтез piper, воспроизведение в гарнитуру
+# и сохранение реплики с меткой времени для автомонтажа прогулки.
+SAY_SCRIPT = "/root/diplom-cpp/tools/say.sh"
 
 MIC_LOG_PATH = "/root/diplom-cpp/mic_audio.raw"
 MIC_LOG_MAX_BYTES = 20 * 1024 * 1024
@@ -37,6 +36,12 @@ MIC_LOG_MAX_BYTES = 20 * 1024 * 1024
 # Файл статуса навигации: C++ ядро (main.cpp) читает его, чтобы подавлять
 # предупреждения об опасности ровно на время реального маршрута.
 NAV_STATUS_PATH = "/dev/shm/nav_active"
+
+# Тег текущего отрезка записи прогулки: его публикует C++ ядро, а сюда он нужен,
+# чтобы складывать записанную диктовку рядом с остальными кусками этого отрезка
+# (см. tools/montage_session.sh).
+SESSION_TAG_PATH = "/dev/shm/nav_session"
+VIDEO_DIR = "/root/diplom-cpp/videos"
 
 # Флаг "микрофон гарнитуры открыт": C++ ядро (main.cpp) читает его и на это
 # время откладывает предупреждения об опасности. Без него предупреждение
@@ -70,6 +75,21 @@ def write_mic_open(open_: bool):
             f.write("1" if open_ else "0")
     except Exception as e:
         print(f"[MicStatus] Не удалось записать статус: {e}")
+
+
+def session_speech_dir():
+    """Каталог кусков текущей записи прогулки или None, если запись не идёт."""
+    try:
+        with open(SESSION_TAG_PATH) as f:
+            tag = f.read().strip()
+    except Exception:
+        return None
+
+    if not tag:
+        return None
+
+    path = os.path.join(VIDEO_DIR, f"speech_{tag}")
+    return path if os.path.isdir(path) else None
 
 
 def cap_log_file(path, max_bytes):
@@ -292,24 +312,26 @@ def play_ready_tone():
 
 
 def speak(text, sync=False):
-    print(f"[Голос]: {text}")
-    safe_text = shlex.quote(text)
-    inner = (
-        f'[ -f {AUDIO_LOG_PATH} ] && [ $(stat -c%s {AUDIO_LOG_PATH}) -gt {AUDIO_LOG_MAX_BYTES} ] && : > {AUDIO_LOG_PATH}; '
-        f'echo {safe_text} | '
-        f'{PIPER_PATH} --model {PIPER_MODEL} --length_scale 0.85 --output-raw | '
-        f'tee -a {AUDIO_LOG_PATH} | '
-        f'aplay -D {playback_device()} -r 22050 -f S16_LE -t raw -c 1 2>/dev/null'
-    )
+    """Произносит фразу через общий с C++ ядром скрипт озвучки (tools/say.sh).
 
+    Конвейер piper|aplay больше не собирается здесь строкой: он был выписан
+    дважды — тут и в main.cpp через std::system, и правки расходились (ядро
+    так и осталось с "-D default", когда демон уже адресовался bluez-синку по
+    имени). Заодно say.sh сохраняет реплику с меткой времени, из которых
+    tools/montage_session.sh собирает голосовую дорожку ролика.
+
+    Команда передаётся списком без shell: flock умеет запускать программу
+    напрямую, поэтому текст фразы не проходит ни через одну стадию разбора
+    оболочкой и не нуждается в экранировании.
+    """
+    print(f"[Голос]: {text}")
+    cmd = ["flock", AUDIO_LOCK_PATH, SAY_SCRIPT, text, "nav"]
     custom_env = pulse_env()
 
-    # Аргументы передаются списком (а не одной shell-строкой), чтобы safe_text
-    # не ломался при повторном оборачивании во flock -c '...'.
     if sync:
-        subprocess.run(["flock", AUDIO_LOCK_PATH, "-c", inner], env=custom_env)
+        subprocess.run(cmd, env=custom_env)
     else:
-        subprocess.Popen(["flock", AUDIO_LOCK_PATH, "-c", inner], env=custom_env)
+        subprocess.Popen(cmd, env=custom_env)
 
 
 def normalize_text(text):
@@ -409,11 +431,34 @@ def listen_and_transcribe(model, seconds):
     custom_env = pulse_env()
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, env=custom_env)
 
+    # Копия диктовки для монтажа прогулки. Это единственная запись, где голос
+    # человека слышно чисто: микрофон гарнитуры существует только в профиле
+    # HFP, то есть ровно в эти несколько секунд, а фоновый микрофон вебкамеры
+    # снимает всю улицу разом. Метка времени ставится по первому пришедшему
+    # блоку, а не по запуску ffmpeg: между ними уходит заметная доля секунды на
+    # открытие потока, и на монтаже это был бы сдвиг дорожки.
+    speech_dir = session_speech_dir()
+    dictation = None
+    dictation_path = None
+    dictation_start = None
+    if speech_dir:
+        try:
+            dictation_path = os.path.join(speech_dir, f"mic_{time.time_ns()}.raw")
+            dictation = open(dictation_path, "wb")
+        except Exception as e:
+            print(f"[STT] Не удалось сохранить диктовку: {e}")
+            dictation = None
+
     text = ""
     try:
         while True:
             data = proc.stdout.read(4000)
             if not data: break
+
+            if dictation:
+                if dictation_start is None:
+                    dictation_start = time.time()
+                dictation.write(data)
 
             with open(MIC_LOG_PATH, "ab") as f_mic:
                 f_mic.write(data)
@@ -427,6 +472,17 @@ def listen_and_transcribe(model, seconds):
         # Снимается в finally: если захват свалится с исключением, ядро иначе
         # осталось бы навсегда с отложенными предупреждениями — то есть немым.
         write_mic_open(False)
+
+        if dictation:
+            dictation.close()
+            if dictation_start is None:
+                os.remove(dictation_path)
+            else:
+                try:
+                    with open(os.path.join(speech_dir, "mic.tsv"), "a", encoding="utf-8") as f:
+                        f.write(f"{dictation_start:.6f}\t{os.path.basename(dictation_path)}\t{text}\n")
+                except Exception as e:
+                    print(f"[STT] Не удалось записать индекс диктовки: {e}")
 
     return text
 
