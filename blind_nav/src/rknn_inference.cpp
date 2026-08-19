@@ -7,7 +7,8 @@
 #include <algorithm>
 #include <chrono>
 
-// Входное разрешение модели yolo11_final.rknn.
+// Входное разрешение обеих моделей (yolo11_int8.rknn — боевая,
+// yolo11_final.rknn — прежняя FP16): геометрия у них одинаковая.
 static const int INPUT_W = 512;
 static const int INPUT_H = 512;
 static const int INPUT_C = 3;
@@ -76,11 +77,12 @@ bool RKNNModel::setup_zero_copy_input() {
         return false;
     }
 
-    // yolo11_final.rknn принимает FP16-вход (модель не квантована), поэтому
-    // rknn_inputs_set с type=UINT8 каждый кадр гоняет конверсию uint8->fp16 на
-    // 786432 значения — это и есть те 25 мс. Здесь конвертируем сами (OpenCV,
-    // NEON) прямо в буфер NPU. UINT8 тоже поддерживаем — на случай, если модель
-    // когда-нибудь пересоберут с квантованным входом.
+    // Тип входа спрашивается у самой модели, а не предполагается: боевая
+    // yolo11_int8.rknn принимает UINT8, прежняя yolo11_final.rknn — FP16, и
+    // переключение MODEL_PATH в main.cpp не должно требовать правок здесь.
+    // Для FP16-модели rknn_inputs_set с type=UINT8 каждый кадр гонял бы
+    // конверсию uint8->fp16 на 786432 значения — это и есть те 25 мс; поэтому
+    // конвертируем сами (OpenCV, NEON) прямо в буфер NPU.
     if (input_attr.fmt != RKNN_TENSOR_NHWC) return false;
     if (input_attr.type == RKNN_TENSOR_FLOAT16) {
         input_is_fp16 = true;
@@ -213,7 +215,8 @@ std::vector<std::vector<float>> RKNNModel::infer(const cv::Mat& img, InferTiming
         return {};
     }
 
-    // Ожидаемые размеры 3-х выходов для imgsz=512 (архитектура yolo11_final.rknn):
+    // Ожидаемые размеры 3-х выходов для imgsz=512 (архитектура одинакова у
+    // обеих моделей — они собраны из одних весов):
     // P3 (мелкие объекты): 74 * 64 * 64 = 303104
     // P4 (средние объекты): 74 * 32 * 32 = 75776
     // P5 (крупные объекты): 74 * 16 * 16 = 18944

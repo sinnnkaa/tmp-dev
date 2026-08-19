@@ -9,8 +9,9 @@
 # Использование: mic_check.sh [секунд]
 set -u
 
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/voice_env.sh"
+
 SECONDS_TO_RECORD="${1:-5}"
-export PULSE_RUNTIME_PATH=/run/user/0/pulse
 TMP=$(mktemp -d /dev/shm/mic_check_XXXXXX)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -38,7 +39,7 @@ check_source() {
     echo "=== $name: $src"
     pactl set-source-volume "$src" 100% >/dev/null 2>&1
     echo "  говорите вслух ${SECONDS_TO_RECORD} секунд..."
-    if ! ffmpeg -hide_banner -loglevel error -f pulse -i "$src" \
+    if ! ffmpeg -nostdin -hide_banner -loglevel error -f pulse -i "$src" \
             -t "$SECONDS_TO_RECORD" -ac 1 -ar 16000 -y "$TMP/$name.wav"; then
         echo "  записать не удалось"
         return

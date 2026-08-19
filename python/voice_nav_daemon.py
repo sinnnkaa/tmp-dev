@@ -9,6 +9,10 @@ import socket
 import threading
 from vosk import Model, KaldiRecognizer
 
+# Тексты, произносимые по шаблону, живут отдельным модулем без зависимостей —
+# из него же их берёт сборщик кэша озвучки (tools/build_voice_cache.sh).
+from phrases import TURN_ANNOUNCE_MAX_DIST, plural_meters, turn_phrase
+
 try:
     import gps
 except ImportError:
@@ -18,7 +22,6 @@ except ImportError:
 ADDRESS_DB_PATH = "/root/diplom-cpp/blind_nav/map/addresses.json"
 OSRM_URL = "http://127.0.0.1:5000/route/v1/foot/"
 VOSK_MODEL_PATH = "/root/diplom-cpp/blind_nav/vosk/model"
-BT_CARD = "bluez_card.1C_6E_4C_89_E9_32"
 SOCKET_PORT = 9999
 
 # Общая блокировка звукового устройства с C++ ядром (main.cpp), чтобы
@@ -33,14 +36,24 @@ SAY_SCRIPT = "/root/diplom-cpp/tools/say.sh"
 MIC_LOG_PATH = "/root/diplom-cpp/mic_audio.raw"
 MIC_LOG_MAX_BYTES = 20 * 1024 * 1024
 
-# Файл статуса навигации: C++ ядро (main.cpp) читает его, чтобы подавлять
-# предупреждения об опасности ровно на время реального маршрута.
+# Диагностический признак "идёт маршрут". Раньше его читало C++ ядро, чтобы
+# подавлять предупреждения об опасности на время навигации; подавление убрано
+# по техзаданию — предупреждение должно звучать всегда, — и потребителя у файла
+# больше нет. Оставлен как способ снаружи посмотреть состояние демона
+# (cat /dev/shm/nav_active), поведение системы от него не зависит.
 NAV_STATUS_PATH = "/dev/shm/nav_active"
 
 # Тег текущего отрезка записи прогулки: его публикует C++ ядро, а сюда он нужен,
 # чтобы складывать записанную диктовку рядом с остальными кусками этого отрезка
 # (см. tools/montage_session.sh).
 SESSION_TAG_PATH = "/dev/shm/nav_session"
+
+# Частота захвата с микрофона гарнитуры: её требует Vosk и в ней же работает
+# HFP-синк (mSBC), пересчёт на лету только портит звук. На этой же частоте
+# сохраняется диктовка для монтажа прогулки, поэтому значение продублировано в
+# tools/voice_env.sh (HEADSET_RATE) — оттуда его берёт tools/montage_session.sh.
+# Разойтись им нельзя: диктовка в ролике зазвучала бы не в том темпе.
+HEADSET_RATE = 16000
 VIDEO_DIR = "/root/diplom-cpp/videos"
 
 # Флаг "микрофон гарнитуры открыт": C++ ядро (main.cpp) читает его и на это
@@ -60,7 +73,7 @@ NAV_ACTIVE = False
 
 
 def write_nav_status(active: bool):
-    """Синхронизирует статус навигации с C++ ядром через общий файл в tmpfs."""
+    """Публикует признак "идёт маршрут" в tmpfs (см. NAV_STATUS_PATH)."""
     try:
         with open(NAV_STATUS_PATH, "w") as f:
             f.write("1" if active else "0")
@@ -117,7 +130,7 @@ def pulse_env():
 def bt_device_name(kind):
     """Фактическое имя bluez-устройства (kind: "sink" или "source") или None.
 
-    Имя не собирается из BT_CARD руками, а спрашивается у сервера: оно зависит
+    Имя не собирается из MAC-адреса руками, а спрашивается у сервера: оно зависит
     от активного профиля (`bluez_sink.MAC.a2dp_sink` против
     `bluez_sink.MAC.handsfree_head_unit`), а в HFP появляется ещё и
     `bluez_source.MAC.handsfree_head_unit`, которого в A2DP не существует
@@ -140,6 +153,33 @@ def bt_device_name(kind):
     return None
 
 
+def bt_card_name():
+    """Имя bluez-карты гарнитуры или None, если она не подключена.
+
+    Спрашивается у сервера, а не собирается из MAC-адреса, записанного здесь
+    константой. Прежний BT_CARD был третьим экземпляром одного и того же адреса
+    в проекте — в bt_keeper.sh он записан через двоеточия, в диагностике через
+    подчёркивания, здесь в составе имени карты. При замене наушников забыть
+    один из трёх было легко, а результат получался не отказом, а половинчатой
+    работой: подключение есть, профиль не переключается, звук идёт мимо.
+    Теперь адрес записан ровно в одном месте (tools/voice_env.sh), и тому, кто
+    работает с уже подключённой картой, он вообще не нужен.
+    """
+    try:
+        out = subprocess.run(
+            ["pactl", "list", "cards", "short"],
+            capture_output=True, text=True, env=pulse_env()
+        ).stdout
+    except Exception:
+        return None
+
+    for line in out.splitlines():
+        fields = line.split("\t")
+        if len(fields) > 1 and fields[1].startswith("bluez_card."):
+            return fields[1]
+    return None
+
+
 def playback_device():
     """Аргумент -D для aplay: конкретный bluez-синк, а не "default".
 
@@ -156,6 +196,10 @@ def playback_device():
 
     Если гарнитуры нет (не подключена, севшая батарея), остаётся "default" —
     тогда звук идёт хоть куда-то, а не пропадает совсем.
+
+    Тот же поиск на shell живёт в tools/voice_env.sh (voice_playback_device) —
+    им пользуются озвучка и диагностика. Разные языки, общий код невозможен;
+    правки нужны в обоих местах.
     """
     sink = bt_device_name("sink")
     return f"pulse:{sink}" if sink else "default"
@@ -224,10 +268,18 @@ def switch_bt_profile(profile, verify_timeout=3.0, retries=1):
     демона."""
     custom_env = pulse_env()
 
+    card = bt_card_name()
+    if not card:
+        # Наушники выключены или вне зоны. Раньше здесь шла команда карте с
+        # именем, собранным из константы: pactl молча отвечал ошибкой, а демон
+        # продолжал так, будто профиль переключился.
+        print("[BT Error] bluez-карты нет — гарнитура не подключена.")
+        return False
+
     for attempt in range(retries + 1):
         try:
             subprocess.run(
-                ["pactl", "set-card-profile", BT_CARD, profile],
+                ["pactl", "set-card-profile", card, profile],
                 check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 env=custom_env
             )
@@ -244,7 +296,7 @@ def switch_bt_profile(profile, verify_timeout=3.0, retries=1):
                 ).stdout
             except Exception:
                 break
-            idx = out.find(BT_CARD)
+            idx = out.find(card)
             if idx != -1 and f"Active Profile: {profile}" in out[idx:idx + 2000]:
                 bind_defaults_to_bt()
                 return True
@@ -287,7 +339,7 @@ def play_ready_tone():
     Громкость: `pactl set-sink-volume 150%` из предыдущей правки не дал
     заметного эффекта на живом тесте ("тихий"). Настоящая причина, скорее
     всего, была не в шагах AT+VGS гарнитуры, а в том, что громкость крутилась
-    у синка, собранного из BT_CARD "на бумаге", тогда как звук в этот момент
+    у синка, собранного из MAC-адреса "на бумаге", тогда как звук в этот момент
     мог играть совсем в другое устройство (см. playback_device). Теперь и
     громкость, и воспроизведение адресуются одному и тому же фактическому
     синку. Амплитуда сигнала оставлена на 1.0 (пик без клиппинга)."""
@@ -406,27 +458,21 @@ def get_route(start_lat, start_lon, end_lat, end_lon):
     return None, None
 
 
-def direction_to_russian(direction):
-    mapping = {
-        "left": "налево", "right": "направо", "straight": "прямо",
-        "slight left": "немного левее", "slight right": "немного правее",
-        "sharp left": "резко налево", "sharp right": "резко направо", "uturn": "развернитесь"
-    }
-    return mapping.get(direction, "прямо")
-
-
 def listen_and_transcribe(model, seconds):
     """Захватывает звук с гарнитуры и возвращает распознанный текст (или пустую строку)."""
     cap_log_file(MIC_LOG_PATH, MIC_LOG_MAX_BYTES)
 
-    rec = KaldiRecognizer(model, 16000)
+    rec = KaldiRecognizer(model, HEADSET_RATE)
     # Флаг ставится до запуска ffmpeg, а не после: ядро опрашивает файл раз в
     # 300мс, и запас нужен именно на старте, пока запись ещё не пошла.
     write_mic_open(True)
     source = capture_device()
     print(f"[STT] Источник записи: {source}")
-    cmd = ['ffmpeg', '-loglevel', 'quiet', '-f', 'pulse', '-i', source,
-           '-ar', '16000', '-ac', '1', '-f', 's16le', '-t', str(seconds), '-']
+    # -nostdin: демон запускается под systemd и из shell, и ffmpeg не должен
+    # трогать чужой стандартный ввод — это уже стоило потери данных в сборщике
+    # кэша озвучки, где он вычитал себе список фраз.
+    cmd = ['ffmpeg', '-nostdin', '-loglevel', 'quiet', '-f', 'pulse', '-i', source,
+           '-ar', str(HEADSET_RATE), '-ac', '1', '-f', 's16le', '-t', str(seconds), '-']
 
     custom_env = pulse_env()
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, env=custom_env)
@@ -563,7 +609,8 @@ def navigation_worker(model, addresses_db, address_keys):
         write_nav_status(False)
         return
 
-    speak(f"Маршрут до {address_name} построен. Расстояние {int(dist)} метров.", sync=True)
+    dist_m = int(dist)
+    speak(f"Маршрут до {address_name} построен. Расстояние {dist_m} {plural_meters(dist_m)}.", sync=True)
 
     last_announced_loc = ""
     consecutive_route_failures = 0
@@ -602,9 +649,8 @@ def navigation_worker(model, addresses_db, address_keys):
             loc_str = f"{loc[0]},{loc[1]}"
 
             if direction not in ["straight", "slight left", "slight right"]:
-                if step_dist < 30 and loc_str != last_announced_loc:
-                    dir_ru = direction_to_russian(direction)
-                    speak(f"Через {step_dist} метров {dir_ru}", sync=True)
+                if step_dist < TURN_ANNOUNCE_MAX_DIST and loc_str != last_announced_loc:
+                    speak(turn_phrase(step_dist, direction), sync=True)
                     last_announced_loc = loc_str # Запоминаем, что уже сказали
 
         for _ in range(10):

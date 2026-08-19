@@ -41,3 +41,7 @@ blind_nav/tests/rgb_bug_demo/npu_real/*.avi
 # запуск, пересобираются из исходного ролика одной командой.
 replay_out/
 videos/
+
+# Кэш готовых реплик piper: генерируется на месте (tools/build_voice_cache.sh),
+# десятки мегабайт звука, зависит от конкретной голосовой модели.
+piper/cache/

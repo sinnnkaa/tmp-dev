@@ -24,20 +24,17 @@ set -e
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# Параметры синтеза берутся оттуда же, откуда их берёт боевая озвучка: свой
+# экземпляр length_scale здесь означал бы, что голос в демонстрационном ролике
+# звучит в другом темпе, чем у устройства, и заметить это можно только на слух.
+. "$REPO_DIR/tools/voice_env.sh"
+
 IN_VIDEO="${1:-}"
 OUT_DIR="${2:-$REPO_DIR/replay_out}"
 FPS="${3:-25}"
 
-PIPER="$REPO_DIR/piper/piper/piper"
-PIPER_MODEL="$REPO_DIR/piper/ru_RU-irina-medium.onnx"
 REPLAY_BIN="$REPO_DIR/blind_nav/build/video_replay"
 MODEL="$REPO_DIR/blind_nav/model/yolo11_int8.rknn"
-
-# Частота piper-выхода и length_scale держатся одинаковыми с боевым трактом
-# (voice_nav_daemon.py speak() и main.cpp): иначе голос в ролике звучал бы
-# в другом темпе, чем у устройства.
-PIPER_RATE=22050
-PIPER_LENGTH_SCALE=0.85
 
 die() { echo "ОШИБКА: $*" >&2; exit 1; }
 
@@ -45,7 +42,7 @@ die() { echo "ОШИБКА: $*" >&2; exit 1; }
 [ -f "$IN_VIDEO" ] || die "нет такого файла: $IN_VIDEO"
 [ -x "$REPLAY_BIN" ] || die "нет $REPLAY_BIN. Соберите: cd blind_nav/build && cmake -DBUILD_VIDEO_REPLAY=ON .. && make video_replay"
 [ -f "$MODEL" ] || die "нет модели: $MODEL"
-[ -x "$PIPER" ] || die "нет piper: $PIPER"
+[ -x "$PIPER_BIN" ] || die "нет piper: $PIPER_BIN"
 [ -f "$PIPER_MODEL" ] || die "нет голосовой модели: $PIPER_MODEL"
 command -v ffmpeg >/dev/null || die "нужен ffmpeg"
 
@@ -101,7 +98,7 @@ for line in "${EVENT_LINES[@]}"; do
     # --output-raw + ffmpeg вместо piper --output_file: тот же сырой поток
     # s16le, что уходит в aplay на устройстве, без промежуточного формата.
     printf '%s\n' "$phrase" |
-        "$PIPER" --model "$PIPER_MODEL" --length_scale "$PIPER_LENGTH_SCALE" --output-raw 2>/dev/null |
+        "$PIPER_BIN" --model "$PIPER_MODEL" --length_scale "$PIPER_LENGTH_SCALE" --output-raw 2>/dev/null |
         ffmpeg -loglevel error -y -f s16le -ar "$PIPER_RATE" -ac 1 -i - "$wav"
 
     [ -s "$wav" ] || die "piper не озвучил фразу: $phrase"

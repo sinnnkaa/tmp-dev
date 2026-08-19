@@ -49,10 +49,15 @@ cat <<'EOF'
   1. Собрать C++ ядро:
        cd blind_nav && mkdir -p build && cd build
        cmake .. && make -j4
-  2. Проверить, что модель на месте: blind_nav/model/yolo11_final.rknn
+  2. Проверить, что модель на месте: blind_nav/model/yolo11_int8.rknn
+     (именно её грузит main.cpp; yolo11_final.rknn — прежняя FP16-версия)
   3. Проверить камеру, микрофон/наушники, GPS.
   4. Поставить Docker (нужен для osrm.service) — см. deploy/osrm/README.md.
-  5. Запустить сервисы:
+  5. Собрать кэш озвучки — иначе первое произнесение каждой фразы ждёт
+     синтеза около пяти секунд. Разово и надолго (порядка получаса на 440
+     фраз), лучше запускать при остановленном blind_nav_main:
+       bash tools/build_voice_cache.sh
+  6. Запустить сервисы:
        systemctl start osrm.service bt_keeper.service nav_daemon.service blind_nav_main.service nav_record.service
 
 См. TESTING.md — чек-лист ручной проверки на плате.

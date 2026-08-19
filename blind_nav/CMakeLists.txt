@@ -112,3 +112,20 @@ if(BUILD_VIDEO_REPLAY)
         ${RKNN_API_PATH}
     )
 endif()
+
+# Печать всех возможных фраз предупреждений — источник списка для
+# предварительного синтеза (tools/build_voice_cache.sh). Названия классов и
+# склонения берутся из боевого threat_logic.cpp, поэтому кэш не может
+# разъехаться с тем, что устройство произносит на самом деле.
+# Запуск: cmake -DBUILD_VOICE_PHRASES=ON .. && make voice_phrases
+option(BUILD_VOICE_PHRASES "Собрать voice_phrases — список фраз для кэша озвучки" OFF)
+if(BUILD_VOICE_PHRASES)
+    add_executable(voice_phrases
+        tools/voice_phrases.cpp
+        src/threat_logic.cpp
+        src/pipeline.cpp
+        src/decode.cpp
+    )
+    target_include_directories(voice_phrases PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(voice_phrases ${OpenCV_LIBS})
+endif()

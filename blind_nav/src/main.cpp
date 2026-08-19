@@ -28,11 +28,6 @@
 // коэффициенты формулы (4)) живут в pipeline.cpp — их разделяет с этим
 // файлом оффлайн-прогон видео, и разъезжаться им нельзя.
 
-// Файл статуса макронавигации: пишет python-демон (voice_nav_daemon.py),
-// читает C++ ядро, чтобы подавлять предупреждения ровно на время реального
-// маршрута, а не на фиксированное окно.
-const char* NAV_STATUS_PATH = "/dev/shm/nav_active";
-
 // Флаг "микрофон гарнитуры открыт": nav_daemon.service держит его на время
 // захвата речи через Vosk. Предупреждение об опасности в этот момент звучит в
 // тот же наушник, с микрофона которого идёт запись, поэтому TTS попадает в
@@ -54,8 +49,11 @@ const char* AUDIO_LOCK_PATH = "/run/lock/blind_nav_audio.lock";
 // времени для автомонтажа ролика (tools/montage_session.sh).
 const char* SAY_SCRIPT = "/root/diplom-cpp/tools/say.sh";
 
-// Квантованная модель: 25.3 FPS против 10.6 у прежней FP16-версии при падении
+// Квантованная модель: 25.3 против 10.6 FPS у прежней FP16-версии при падении
 // полноты в опасной зоне на 2% по машинам и 5% по людям (замеры — METRICS.md).
+// Оба числа — со стенда оценки на подготовленных изображениях, а не темп
+// устройства: на плате с камерой живой прогон даёт около 18 кадров/с
+// (инференс 41 мс), остальное съедают захват кадра, отрисовка и запись видео.
 // Прежняя yolo11_final.rknn оставлена рядом: чтобы вернуться, достаточно
 // поменять путь здесь и пересобрать, формат выходов у моделей одинаковый.
 const char* MODEL_PATH = "/root/diplom-cpp/blind_nav/model/yolo11_int8.rknn";
@@ -84,7 +82,6 @@ const long VIDEO_SEGMENT_MAX_BYTES = 500L * 1024 * 1024;
 // вспомогательная функция, она обязана уступить первой.
 const long VIDEO_MIN_FREE_BYTES = 2L * 1024 * 1024 * 1024;
 
-std::atomic<bool> is_navigating(false);
 std::atomic<bool> keep_running(true);
 
 // Запрос на сброс трекинга от потока кнопки. Раньше listen_button() дёргал
@@ -153,9 +150,25 @@ static long long free_bytes(const char* dir) {
 class SessionRecorder {
 public:
     void write(const cv::Mat& frame) {
-        if (stopped_) return;
+        if (disabled_) return;
+
+        // Запись приостановлена из-за нехватки места. Проверяем не чаще раза в
+        // полминуты и возобновляем, как только место появилось: автомонтаж
+        // (tools/montage_session.sh) удаляет исходные MJPG после сборки ролика
+        // и освобождает по полгигабайта за раз — без этой проверки первая же
+        // заполнившаяся карта означала бы "видео больше не пишется никогда",
+        // хотя место уже есть.
+        if (paused_) {
+            if (std::chrono::steady_clock::now() < resume_check_) return;
+            resume_check_ = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            long long avail = free_bytes(VIDEO_DIR);
+            if (avail >= 0 && avail < VIDEO_MIN_FREE_BYTES) return;
+            std::cerr << "[Запись] Место на разделе освободилось — возобновляю запись." << std::endl;
+            paused_ = false;
+        }
+
         if (!writer_.isOpened() && !open_new()) {
-            stopped_ = true;
+            disabled_ = true;
             return;
         }
 
@@ -170,7 +183,7 @@ public:
         if (stat(capture_path_.c_str(), &st) == 0 && st.st_size > VIDEO_SEGMENT_MAX_BYTES) {
             std::cerr << "[Запись] Отрезок " << tag_ << " заполнен, начинаю следующий." << std::endl;
             finalize();
-            if (!open_new()) stopped_ = true;
+            if (!open_new()) disabled_ = true;
             return;
         }
 
@@ -180,7 +193,8 @@ public:
                       << " МБ на разделе — останавливаю запись видео, чтобы не забить карту."
                       << std::endl;
             finalize();
-            stopped_ = true;
+            paused_ = true;
+            resume_check_ = std::chrono::steady_clock::now() + std::chrono::seconds(30);
             return;
         }
 
@@ -196,7 +210,11 @@ public:
     }
 
 private:
-    bool stopped_ = false;
+    // disabled_ — отказ, из которого сам процесс не выйдет (не открывается
+    // файл); paused_ — временная остановка по месту на карте, снимается сама.
+    bool disabled_ = false;
+    bool paused_ = false;
+    std::chrono::steady_clock::time_point resume_check_{};
     cv::VideoWriter writer_;
     std::string tag_;
     std::string capture_path_;
@@ -238,8 +256,11 @@ private:
 
     void finalize() {
         if (writer_.isOpened()) writer_.release();
+        // Отдельного маркера "отрезок закрыт" рядом нет намеренно: закрытость
+        // видна по final=1 в самой meta, а монтаж и без него знает, какой
+        // отрезок пишется прямо сейчас — по /dev/shm/nav_session. Файл,
+        // который никто не читает, рано или поздно начинают считать рабочим.
         write_meta(true);
-        std::ofstream done(std::string(VIDEO_DIR) + "/session_" + tag_ + ".done");
         publish_tag("");
     }
 
@@ -405,19 +426,20 @@ void setup_button(int gpio_num) {
     if (dir_file) { dir_file << "in"; dir_file.close(); }
 }
 
-// Синхронизирует is_navigating с реальным статусом макронавигации: python-демон
-// пишет "1"/"0" в NAV_STATUS_PATH в момент старта/остановки маршрута, поэтому
-// подавление предупреждений об опасности длится ровно столько, сколько идёт
-// реальная навигация, а не фиксированные 15 секунд.
-void nav_status_watcher() {
+// Следит за флагом открытого микрофона (см. MIC_OPEN_PATH). Раньше поток
+// назывался nav_status_watcher и следил ещё и за статусом маршрута — имя
+// осталось бы описанием того, чего он больше не делает.
+//
+// Здесь же раньше читался /dev/shm/nav_active в переменную is_navigating —
+// остаток от подавления предупреждений на время GPS-маршрута. Подавление
+// убрано по техзаданию (предупреждение об опасности должно звучать всегда), и
+// переменную с тех пор никто не читал: два потока её писали, решений по ней не
+// принимал никто. Мёртвое состояние опаснее отсутствующего — рано или поздно
+// кто-нибудь начинает считать его рабочим. Демон продолжает писать
+// /dev/shm/nav_active, но теперь это чисто диагностический признак «идёт
+// маршрут», а не вход какой-либо логики.
+void mic_status_watcher() {
     while (keep_running) {
-        std::ifstream f(NAV_STATUS_PATH);
-        if (f.is_open()) {
-            char c = '0';
-            f >> c;
-            is_navigating = (c == '1');
-        }
-
         std::ifstream m(MIC_OPEN_PATH);
         if (m.is_open()) {
             char c = '0';
@@ -448,9 +470,6 @@ void listen_button() {
                 last_press = now;
                 std::cout << "\n[КНОПКА] Cигнал навигатору..." << std::endl;
 
-                // Мгновенно глушим предупреждения об опасности; реальную
-                // длительность подтвердит/снимет python через файл статуса.
-                is_navigating = true;
                 tracking_reset_requested = true;
                 send_start_signal();
             }
@@ -481,7 +500,7 @@ int main(int argc, char** argv) {
     }
 
     std::thread btn_thread(listen_button);
-    std::thread nav_status_thread(nav_status_watcher);
+    std::thread mic_status_thread(mic_status_watcher);
 
     int working_camera = -1;
     for (int i = 0; i < 10; i++) {
@@ -498,7 +517,7 @@ int main(int argc, char** argv) {
         std::cerr << "Ошибка: Камера не найдена!" << std::endl;
         keep_running = false;
         btn_thread.join();
-        nav_status_thread.join();
+        mic_status_thread.join();
         return -1;
     }
 
@@ -575,34 +594,56 @@ int main(int argc, char** argv) {
         // =====================================================================
 
         // Предупреждение об опасности имеет абсолютный приоритет над голосом
-        // маршрута: сначала обрываем любую уже звучащую фразу (aplay
-        // навигационной подсказки, если она есть), затем захватываем общий с
-        // nav_daemon.service flock-лок — так подсказка маршрута не звучит
-        // поверх предупреждения и не заставляет его ждать. Голос маршрута
-        // (Python, speak()) симметрично никого не обрывает — только ждёт лок,
-        // поэтому приоритет всегда у предупреждения об опасности.
+        // маршрута: сначала снимаем всё, что сейчас звучит или синтезируется,
+        // затем захватываем общий с nav_daemon.service flock-лок. Голос
+        // маршрута (voice_nav_daemon.py, speak()) симметрично никого не
+        // обрывает — только ждёт лок, поэтому приоритет всегда у
+        // предупреждения.
         //
         // Раньше здесь стояла проверка !is_navigating — предупреждения
         // полностью подавлялись на время GPS-навигации. По техзаданию это
         // неверно: предупреждение об опасности должно звучать всегда.
         if (decision.speak) {
-            // Снятие текущей озвучки перед своей: сначала сам скрипт озвучки
-            // (иначе он дойдёт до aplay уже после того, как мы убьём piper и
-            // фраза всё равно прозвучит), затем синтез, затем воспроизведение.
-            // Голос маршрута (voice_nav_daemon.py) симметрично никого не
-            // обрывает, только ждёт общий flock — поэтому приоритет всегда у
-            // предупреждения об опасности.
+            // Снимаем всё, что сейчас звучит или синтезируется: скрипт
+            // озвучки, держащий лок flock, сам скрипт, синтез (он остаётся
+            // только на промахах кэша) и воспроизведение.
             //
-            // Раньше здесь стояла проверка !is_navigating — предупреждения
-            // полностью подавлялись на время GPS-навигации. По техзаданию это
-            // неверно: предупреждение об опасности должно звучать всегда.
+            // Каждый шаблон привязан к НАЧАЛУ командной строки — и это не
+            // косметика. pkill -f сверяет шаблон с командными строками всех
+            // процессов, включая ту оболочку, которую std::system подняла ради
+            // этой самой команды; а в её строке дальше стоит запуск
+            // "/root/diplom-cpp/tools/say.sh", то есть шаблон без якоря
+            // находит сам себя. Оболочка убивала себя первым же pkill, и до
+            // запуска озвучки дело не доходило вообще — предупреждения молчали
+            // полностью. Оболочка всегда начинается с "/bin/sh -c", поэтому
+            // якорь на реальное начало каждой цели её исключает.
+            //
+            // Реальные командные строки целей (сверено на плате):
+            //   flock /run/lock/blind_nav_audio.lock /root/.../say.sh <фраза> core
+            //   /bin/bash /root/diplom-cpp/tools/say.sh <фраза> core
+            //   /root/diplom-cpp/piper/piper/piper --model ... --output-raw
+            //   aplay -D <устройство> -r 22050 ... /root/.../piper/cache/<ключ>.raw
+            //
+            // Шаблон piper сужен до "--output-raw": предварительная сборка
+            // кэша (tools/build_voice_cache.sh) зовёт его с --json-input, и без
+            // этого первое же предупреждение обрывало бы её на середине.
+            // Сигнал готовности микрофона играется не из кэша и тоже уцелеет.
             std::string command =
-                std::string("pkill -f 'tools/say.sh' >/dev/null 2>&1; ")
-                + "pkill -f 'piper --model' >/dev/null 2>&1; "
-                + "pkill -f 'aplay -D [^ ]+ -r 22050' >/dev/null 2>&1; "
+                std::string("pkill -f '^flock .*/tools/say[.]sh' >/dev/null 2>&1; ")
+                + "pkill -f '^/bin/bash /root/diplom-cpp/tools/say[.]sh' >/dev/null 2>&1; "
+                + "pkill -f '^/root/diplom-cpp/piper/piper/piper .*--output-raw' >/dev/null 2>&1; "
+                + "pkill -f '^aplay .*piper/cache' >/dev/null 2>&1; "
                 + "flock " + AUDIO_LOCK_PATH + " " + SAY_SCRIPT
                 + " \"" + decision.phrase + "\" core &";
-            std::system(command.c_str());
+
+            // Результат проверяется не для порядка: -1 означает, что форк не
+            // удался (кончились процессы или память) — предупреждение в этот
+            // момент просто не прозвучит, и знать об этом надо из журнала, а
+            // не гадать потом, почему устройство молчало.
+            if (std::system(command.c_str()) == -1) {
+                std::cerr << "[Звук] Не удалось запустить озвучку фразы: "
+                          << decision.phrase << std::endl;
+            }
         }
 
         // Сохраняем чистый кадр (без графики) для веб-стриминга (если нужно)
@@ -640,6 +681,6 @@ int main(int argc, char** argv) {
     std::cout << "\n[Main] Получен сигнал остановки, завершаю потоки..." << std::endl;
     cam_thread.join();
     btn_thread.join();
-    nav_status_thread.join();
+    mic_status_thread.join();
     return 0;
 }

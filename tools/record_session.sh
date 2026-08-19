@@ -13,10 +13,8 @@
 # демон маршрутов, а монтаж сводит обе записи в одну дорожку голоса человека.
 set -u
 
-ROOT=/root/diplom-cpp
-VIDEO_DIR="$ROOT/videos"
-TOOLS="$ROOT/tools"
-SESSION_TAG_FILE=/dev/shm/nav_session
+TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$TOOLS/voice_env.sh"
 
 # Пауза перед догоняющим монтажом после перезагрузки: если плату включили,
 # чтобы сразу идти, монтаж не должен отбирать ядра у распознавания в первые
@@ -25,8 +23,6 @@ MONTAGE_ON_START="${MONTAGE_ON_START:-1}"
 MONTAGE_START_DELAY="${MONTAGE_START_DELAY:-60}"
 # Сколько секунд отсутствия записи считать "прогулка кончилась".
 IDLE_BEFORE_MONTAGE="${IDLE_BEFORE_MONTAGE:-30}"
-
-export PULSE_RUNTIME_PATH=/run/user/0/pulse
 
 MIC_PID=""
 CUR_TAG=""
@@ -65,6 +61,15 @@ start_mic() {
            -c:a libmp3lame -q:a 5 -f mp3 pipe:1 >> "$VIDEO_DIR/ambient_$tag.mp3" &
     MIC_PID=$!
     log "пишу фоновый микрофон ($src) → ambient_$tag.mp3"
+}
+
+# Жив ли процесс записи. Одного kill -0 мало: пока bash не сделал wait, мёртвый
+# ffmpeg остаётся зомби в таблице процессов, и kill -0 по нему успешен — надзор
+# ниже считал бы оборвавшуюся запись живой до конца прогулки и не поднял бы её.
+mic_alive() {
+    [ -n "$MIC_PID" ] || return 1
+    kill -0 "$MIC_PID" 2>/dev/null || return 1
+    [ "$(awk '{print $3}' "/proc/$MIC_PID/stat" 2>/dev/null)" != "Z" ]
 }
 
 stop_mic() {
@@ -114,6 +119,24 @@ trap on_exit TERM INT
 mkdir -p "$VIDEO_DIR"
 log "старт"
 
+# Кэш озвучки растёт только за счёт фраз с названиями улиц — предупреждений в
+# нём конечное число. Но растёт он бесконечно, а места на карте немного,
+# поэтому при превышении потолка выбрасываем давно не звучавшие реплики.
+prune_voice_cache() {
+    [ -d "$VOICE_CACHE_DIR" ] || return
+    local size
+    size=$(du -sb "$VOICE_CACHE_DIR" 2>/dev/null | cut -f1)
+    [ -z "$size" ] && return
+    [ "$size" -le "$VOICE_CACHE_MAX_BYTES" ] && return
+
+    log "кэш озвучки разросся до $((size / 1024 / 1024)) МБ — чищу давно не звучавшее"
+    # Сортировка по времени последнего доступа: свежие предупреждения остаются,
+    # уходят фразы с адресами, которые больше не строятся.
+    find "$VOICE_CACHE_DIR" -name '*.raw' -printf '%A@\t%p\n' 2>/dev/null \
+        | sort -n | head -n 200 | cut -f2- | xargs -r rm -f
+}
+prune_voice_cache
+
 if [ "$MONTAGE_ON_START" = "1" ]; then
     (
         sleep "$MONTAGE_START_DELAY"
@@ -129,8 +152,9 @@ while true; do
         stop_mic
         CUR_TAG="$TAG"
         [ -n "$CUR_TAG" ] && start_mic "$CUR_TAG"
-    elif [ -n "$CUR_TAG" ] && [ -n "$MIC_PID" ] && ! kill -0 "$MIC_PID" 2>/dev/null; then
+    elif [ -n "$CUR_TAG" ] && [ -n "$MIC_PID" ] && ! mic_alive; then
         log "запись микрофона оборвалась — поднимаю заново"
+        wait "$MIC_PID" 2>/dev/null
         MIC_PID=""
         start_mic "$CUR_TAG"
     fi
@@ -139,7 +163,11 @@ while true; do
         IDLE=$((IDLE + 1))
         if [ "$IDLE" -eq "$IDLE_BEFORE_MONTAGE" ] && has_backlog; then
             log "запись не идёт — монтирую накопившееся"
-            "$TOOLS/montage_session.sh" --all
+            # В фоне, а не в самом цикле: монтаж идёт минутами, и всё это время
+            # цикл не видел бы, что запись возобновилась — человек пошёл бы
+            # второй раз без записи микрофона. Наложения не будет, монтаж
+            # держит собственный flock.
+            "$TOOLS/montage_session.sh" --all &
         fi
     else
         IDLE=0

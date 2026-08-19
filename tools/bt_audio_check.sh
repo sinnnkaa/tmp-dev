@@ -14,8 +14,8 @@
 # карта физически осталась в HFP. Если какой-то не слышен вовсе — он ушёл не
 # в гарнитуру, смотреть строку "Играю в:" под ним.
 
-export PULSE_RUNTIME_PATH=/run/user/0/pulse
-MAC_UND="1C_6E_4C_89_E9_32"
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/voice_env.sh"
+MAC_UND="$BLINDNAV_BT_MAC_UND"
 CARD="bluez_card.${MAC_UND}"
 
 fail() { echo "ОШИБКА: $*"; exit 1; }

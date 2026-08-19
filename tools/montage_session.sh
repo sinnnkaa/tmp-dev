@@ -22,9 +22,9 @@
 #   VOICE_GAIN, MIC_GAIN  громкость дорожек в общем миксе
 set -u
 
-ROOT=/root/diplom-cpp
-VIDEO_DIR="$ROOT/videos"
-TOOLS="$ROOT/tools"
+TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$TOOLS/voice_env.sh"
+
 LOCK=/run/lock/blind_nav_montage.lock
 
 KEEP_CAPTURE="${KEEP_CAPTURE:-0}"
@@ -39,7 +39,9 @@ AMBIENT_GAIN="${AMBIENT_GAIN:-0.8}"
 
 meta_get() { sed -n "s/^$2=//p" "$1" | tail -1; }
 
-ff() { nice -n 19 ionice -c 3 ffmpeg -hide_banner -loglevel error -y "$@"; }
+# -nostdin: монтаж запускается и из циклов, и из systemd-юнита без
+# терминала — ffmpeg не должен трогать чужой стандартный ввод.
+ff() { nice -n 19 ionice -c 3 ffmpeg -nostdin -hide_banner -loglevel error -y "$@"; }
 
 montage_one() {
     local tag="$1"
@@ -101,8 +103,8 @@ montage_one() {
     local speech_dir tmp_speech tmp_headset
     speech_dir="$VIDEO_DIR/speech_$tag"
     tmp_speech=$(mktemp /dev/shm/track_piper_XXXXXX.raw)
-    "$TOOLS/build_speech_track.py" "$speech_dir" speech.tsv 22050 "$start_epoch" "$duration" "$tmp_speech"
-    ff -f s16le -ar 22050 -ac 1 -i "$tmp_speech" -c:a libmp3lame -q:a 4 "$piper_mp3"
+    "$TOOLS/build_speech_track.py" "$speech_dir" speech.tsv "$PIPER_RATE" "$start_epoch" "$duration" "$tmp_speech"
+    ff -f s16le -ar "$PIPER_RATE" -ac 1 -i "$tmp_speech" -c:a libmp3lame -q:a 4 "$piper_mp3"
     rm -f "$tmp_speech"
 
     # 3. Голос человека. Две независимые записи, и это не избыточность:
@@ -112,7 +114,7 @@ montage_one() {
     # тише. По отдельности каждый источник теряет половину прогулки, вместе
     # дают связную дорожку.
     tmp_headset=$(mktemp /dev/shm/track_mic_XXXXXX.raw)
-    "$TOOLS/build_speech_track.py" "$speech_dir" mic.tsv 16000 "$start_epoch" "$duration" "$tmp_headset"
+    "$TOOLS/build_speech_track.py" "$speech_dir" mic.tsv "$HEADSET_RATE" "$start_epoch" "$duration" "$tmp_headset"
 
     if [ -s "$ambient_mp3" ]; then
         local amb_epoch delay_ms trim
@@ -120,13 +122,13 @@ montage_one() {
         delay_ms=$(awk -v a="$amb_epoch" -v b="$start_epoch" 'BEGIN{d=(a-b)*1000; if(d<0)d=0; printf "%d", d}')
         trim=$(awk -v a="$amb_epoch" -v b="$start_epoch" 'BEGIN{d=b-a; if(d<0)d=0; printf "%.3f", d}')
 
-        ff -f s16le -ar 16000 -ac 1 -i "$tmp_headset" -ss "$trim" -i "$ambient_mp3" \
+        ff -f s16le -ar "$HEADSET_RATE" -ac 1 -i "$tmp_headset" -ss "$trim" -i "$ambient_mp3" \
            -filter_complex \
            "[0:a]volume=$HEADSET_GAIN[h];[1:a]adelay=$delay_ms:all=1,volume=$AMBIENT_GAIN[b];[h][b]amix=inputs=2:normalize=0:duration=first[m]" \
            -map "[m]" -c:a libmp3lame -q:a 5 "$mic_mp3"
     else
         echo "[Монтаж] $tag: непрерывной записи микрофона нет, беру только диктовку с гарнитуры"
-        ff -f s16le -ar 16000 -ac 1 -i "$tmp_headset" -c:a libmp3lame -q:a 5 "$mic_mp3"
+        ff -f s16le -ar "$HEADSET_RATE" -ac 1 -i "$tmp_headset" -c:a libmp3lame -q:a 5 "$mic_mp3"
     fi
     rm -f "$tmp_headset"
 
@@ -169,7 +171,7 @@ montage_all() {
         tag=$(basename "$meta" .meta); tag=${tag#session_}
         [ -f "$VIDEO_DIR/session_$tag.montaged" ] && continue
         # Отрезок, который прямо сейчас пишется, не трогаем.
-        [ "$tag" = "$(cat /dev/shm/nav_session 2>/dev/null || true)" ] && continue
+        [ "$tag" = "$(cat "$SESSION_TAG_FILE" 2>/dev/null || true)" ] && continue
         any=1
         montage_one "$tag" || true
     done
@@ -193,5 +195,11 @@ main() {
 # Монтаж тяжёлый и однопоточным его держит не вежливость, а NPU: параллельные
 # кодировщики отбирают ядра у распознавания препятствий.
 exec 9>"$LOCK"
-flock 9
+# Ждать бесконечно нельзя: монтаж запускается и по простою, и по остановке
+# сервиса, и вручную — без ограничения набралась бы очередь из оболочек,
+# висящих до перезагрузки. Час — заведомо больше самого долгого отрезка.
+if ! flock -w 3600 9; then
+    echo "[Монтаж] Другой монтаж уже идёт больше часа — выхожу."
+    exit 0
+fi
 main "$@"
