@@ -22,6 +22,16 @@ float compute_danger_score(float w_class, float w_pos, float distance, float ttc
     return w_class * w_pos * (1.0f / (distance + dist_eps) + ttc_term);
 }
 
+bool is_obstacle_class(int class_id) {
+    switch (class_id) {
+        case 8:  // sidewalk — покрытие под ногами
+        case 9:  // crosswalk — разметка на дороге
+            return false;
+        default:
+            return true;
+    }
+}
+
 float get_real_height(int class_id) {
     switch(class_id) {
         case 0: return 1.70f;

@@ -15,6 +15,20 @@ float compute_distance(float focal_length, float real_height, float box_height_p
 float compute_danger_score(float w_class, float w_pos, float distance, float ttc,
                             float dist_eps, float ttc_eps, float ttc_k);
 
+// Является ли класс препятствием, о котором имеет смысл предупреждать голосом.
+//
+// sidewalk и crosswalk — разметка и покрытие под ногами, а не объекты на пути:
+// налететь на тротуар нельзя, по нему идут. При этом оценка дистанции для них
+// заведомо бессмысленна — compute_distance делит на высоту рамки, а "реальная
+// высота" покрытия задана как 0.05 м, поэтому широкая полоса асфальта внизу
+// кадра всегда выглядит как объект в полуметре и выигрывает конкурс угроз.
+// На прогоне реального ролика (tools/replay_video.sh) это дало в эфир фразу
+// "Тротуар прямо, 3 метра" вместо предупреждения о чём-то настоящем.
+//
+// Детектироваться и рисоваться эти классы продолжают — исключены они только из
+// голосовых предупреждений об опасности.
+bool is_obstacle_class(int class_id);
+
 float get_real_height(int class_id);
 float get_class_weight(int class_id);
 std::string get_class_name_en(int class_id);

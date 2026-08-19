@@ -29,6 +29,7 @@ add_executable(blind_nav
     src/rknn_inference.cpp
     src/decode.cpp
     src/threat_logic.cpp
+    src/pipeline.cpp
 )
 
 target_link_libraries(blind_nav
@@ -85,6 +86,28 @@ if(BUILD_VIDEO_BENCH)
         src/threat_logic.cpp
     )
     target_link_libraries(rknn_video_bench
+        ${OpenCV_LIBS}
+        ${RKNN_API_PATH}
+    )
+endif()
+
+# Оффлайн-прогон записанного видео через боевой пайплайн: те же decode(),
+# NavPipeline и константы, что на устройстве, только кадры берутся из файла, а
+# вместо звука пишется список реплик с их временем. Нужен, чтобы показать
+# работу системы на материале, который нельзя переснять вживую, и чтобы
+# отладить пороги, не выходя на улицу.
+# Запуск: cmake -DBUILD_VIDEO_REPLAY=ON .. && make video_replay
+#         см. tools/replay_video.sh — он же доозвучивает результат через piper.
+option(BUILD_VIDEO_REPLAY "Собрать video_replay — прогон записанного видео через боевой пайплайн" OFF)
+if(BUILD_VIDEO_REPLAY)
+    add_executable(video_replay
+        tests/video_replay.cpp
+        src/rknn_inference.cpp
+        src/decode.cpp
+        src/threat_logic.cpp
+        src/pipeline.cpp
+    )
+    target_link_libraries(video_replay
         ${OpenCV_LIBS}
         ${RKNN_API_PATH}
     )

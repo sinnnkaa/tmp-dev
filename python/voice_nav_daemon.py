@@ -38,6 +38,14 @@ MIC_LOG_MAX_BYTES = 20 * 1024 * 1024
 # предупреждения об опасности ровно на время реального маршрута.
 NAV_STATUS_PATH = "/dev/shm/nav_active"
 
+# Флаг "микрофон гарнитуры открыт": C++ ядро (main.cpp) читает его и на это
+# время откладывает предупреждения об опасности. Без него предупреждение
+# звучит в тот же наушник, с микрофона которого сейчас пишется адрес, TTS
+# попадает на вход Vosk и портит распознавание. Окно ограничено длительностью
+# захвата (4-7 секунд); ядро откладывает фразу, не сбрасывая выдержку, и
+# произносит её сразу после закрытия микрофона.
+MIC_OPEN_PATH = "/dev/shm/nav_mic_open"
+
 # Порог нечёткого поиска адреса и порог "подряд идущих" сбоев OSRM,
 # после которого пользователь получает голосовое предупреждение.
 ADDRESS_MATCH_CUTOFF = 0.5
@@ -53,6 +61,15 @@ def write_nav_status(active: bool):
             f.write("1" if active else "0")
     except Exception as e:
         print(f"[NavStatus] Не удалось записать статус: {e}")
+
+
+def write_mic_open(open_: bool):
+    """Сообщает C++ ядру, открыт ли сейчас микрофон гарнитуры (см. MIC_OPEN_PATH)."""
+    try:
+        with open(MIC_OPEN_PATH, "w") as f:
+            f.write("1" if open_ else "0")
+    except Exception as e:
+        print(f"[MicStatus] Не удалось записать статус: {e}")
 
 
 def cap_log_file(path, max_bytes):
@@ -381,6 +398,9 @@ def listen_and_transcribe(model, seconds):
     cap_log_file(MIC_LOG_PATH, MIC_LOG_MAX_BYTES)
 
     rec = KaldiRecognizer(model, 16000)
+    # Флаг ставится до запуска ffmpeg, а не после: ядро опрашивает файл раз в
+    # 300мс, и запас нужен именно на старте, пока запись ещё не пошла.
+    write_mic_open(True)
     source = capture_device()
     print(f"[STT] Источник записи: {source}")
     cmd = ['ffmpeg', '-loglevel', 'quiet', '-f', 'pulse', '-i', source,
@@ -404,6 +424,9 @@ def listen_and_transcribe(model, seconds):
                     break
     finally:
         proc.terminate()
+        # Снимается в finally: если захват свалится с исключением, ядро иначе
+        # осталось бы навсегда с отложенными предупреждениями — то есть немым.
+        write_mic_open(False)
 
     return text
 
@@ -537,6 +560,9 @@ def main():
     global NAV_ACTIVE
     print("[Daemon] Инициализация моделей в память...")
     write_nav_status(False)
+    # Демон мог упасть с открытым микрофоном — сбрасываем флаг, иначе ядро
+    # молчало бы до первого удачного захвата.
+    write_mic_open(False)
     switch_bt_profile("a2dp_sink")
     time.sleep(1.0)
 

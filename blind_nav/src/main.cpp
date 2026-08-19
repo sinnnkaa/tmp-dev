@@ -20,69 +20,26 @@
 #include "rknn_inference.h"
 #include "decode.h"
 #include "threat_logic.h"
+#include "pipeline.h"
 
-// Измерено по шагу 1 CALIBRATION.md: калибровка по шахматной доске (9x6
-// внутренних углов, клетка 26мм) через tools/calib/, 640x480 MJPG — тот же
-// тракт, что в бою. fy = 761.5px, стабильно между двумя независимыми
-// съёмками (770.7 и 761.5, отсев смазанных кадров по личной ошибке
-// репроекции). RMS репроекции ~2.4px выше "хорошего" порога в 2px из-за
-// заметной бочкообразной дисторсии дешёвого широкоугольника (k1≈-0.46,
-// тоже стабильно между съёмками) — pinhole-модель без undistort не может
-// вписаться в неё идеально, но сама оценка f сходится уверенно. cx/cy и
-// коэффициенты дисторсии не используются: compute_distance по высоте бокса
-// не требует принципиальной точки. H_cam и угол наклона (шаги 2-3
-// CALIBRATION.md) ещё не измерены — см. TODO там же.
-const float FOCAL_LENGTH = 761.5f;
-const int FRAME_WIDTH = 640;
-const int FRAME_HEIGHT = 480;
-
-// Порог уверенности по классам: цена ошибки у классов разная, поэтому одна
-// константа на всех — компромисс не в ничью пользу. Замер на INT8-модели
-// (500 кадров val, только зона < 7 м, tools/eval/run_thresh_sweep_rknn.py)
-// показал, что смягчение порога окупается ровно у одного класса:
-// traffic_light при 0.25 даёт полноту 0.62 против 0.40 и точность 0.57
-// против 0.55 — лучше сразу по обоим показателям, а не в обмен.
-// У остальных снижение порога только меняет пропуски на ложные срабатывания
-// (у pole при 0.10 полнота 0.73, но точность 0.28), поэтому им оставлен 0.30.
-// Развёртка целиком — в METRICS.md.
-const int CONF_CLASS_COUNT = 10;
-const float CONF_THRESHOLD_BY_CLASS[CONF_CLASS_COUNT] = {
-    0.30f,  // 0 person
-    0.30f,  // 1 car
-    0.30f,  // 2 curb
-    0.30f,  // 3 pole
-    0.30f,  // 4 traffic_sign
-    0.25f,  // 5 traffic_light
-    0.30f,  // 6 trash_can
-    0.30f,  // 7 bench
-    0.30f,  // 8 sidewalk
-    0.30f,  // 9 crosswalk
-};
-// Декодируем по самому мягкому из порогов, отсев по классам идёт после NMS.
-// Порядок важен: если резать до NMS, подавление считается по другому набору
-// кандидатов, и замер порогов перестаёт соответствовать поведению устройства.
-const float CONF_THRESHOLD_MIN = 0.25f;
-
-float conf_threshold_for(int class_id) {
-    if (class_id < 0 || class_id >= CONF_CLASS_COUNT) return 0.30f;
-    return CONF_THRESHOLD_BY_CLASS[class_id];
-}
-const float MAX_DANGER_DIST = 7.0f;
-const float ROI_TOP_MARGIN = 0.30f;
-
-const int PERSISTENCE_THRESHOLD = 3;
-const int TRACK_MAX_LIVES = 2;
-const float TRACK_POS_TOLERANCE = 0.15f;
-
-// Формула (4) из диплома: S_threat = W_class * W_zone * (1/(D+eps) + k/(TTC+eps))
-const float DIST_EPS = 0.1f;
-const float TTC_EPS = 0.3f;
-const float TTC_K = 1.0f;
+// Константы пайплайна (фокусное, пороги классов, параметры трекинга и
+// коэффициенты формулы (4)) живут в pipeline.cpp — их разделяет с этим
+// файлом оффлайн-прогон видео, и разъезжаться им нельзя.
 
 // Файл статуса макронавигации: пишет python-демон (voice_nav_daemon.py),
 // читает C++ ядро, чтобы подавлять предупреждения ровно на время реального
 // маршрута, а не на фиксированное окно.
 const char* NAV_STATUS_PATH = "/dev/shm/nav_active";
+
+// Флаг "микрофон гарнитуры открыт": nav_daemon.service держит его на время
+// захвата речи через Vosk. Предупреждение об опасности в этот момент звучит в
+// тот же наушник, с микрофона которого идёт запись, поэтому TTS попадает в
+// распознаватель и портит адрес — а пользователь в этот момент стоит и
+// диктует, то есть непосредственной опасности от движения нет. Окно короткое
+// и жёстко ограничено длительностью захвата (4-7 секунд), после чего
+// предупреждение прозвучит на следующем же кадре: это отсрочка, а не
+// подавление.
+const char* MIC_OPEN_PATH = "/dev/shm/nav_mic_open";
 
 // Общая блокировка звукового устройства между этим процессом и nav_daemon.service,
 // чтобы предупреждения об опасности и голосовые инструкции маршрута не звучали
@@ -107,6 +64,17 @@ const long VIDEO_MAX_BYTES = VIDEO_TOTAL_MAX_BYTES / 2;
 std::atomic<bool> is_navigating(false);
 std::atomic<bool> keep_running(true);
 
+// Запрос на сброс трекинга от потока кнопки. Раньше listen_button() дёргал
+// tracking_list.clear() прямо у себя, пока главный поток итерировал этот же
+// std::vector и делал в него push_back — неcинхронизированный доступ к
+// контейнеру из двух потоков это UB, а практически — испорченная куча или
+// падение ровно в момент нажатия кнопки при видимых объектах. Теперь поток
+// кнопки только поднимает флаг, а очищает список сам владелец — главный цикл.
+std::atomic<bool> tracking_reset_requested(false);
+
+// См. MIC_OPEN_PATH: на время записи адреса предупреждения откладываются.
+std::atomic<bool> mic_is_open(false);
+
 void handle_signal(int) {
     keep_running = false;
 }
@@ -117,36 +85,14 @@ std::mutex frame_mutex;
 // =========================================================================
 // ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ДЛЯ РЕНДЕРИНГА НА 30 FPS
 // =========================================================================
-struct RenderBox {
-    cv::Rect rect;
-    std::string label;
-    cv::Scalar color;
-    int thickness;
-};
+// RenderBox объявлен в pipeline.h.
 std::vector<RenderBox> shared_boxes_to_render;
 std::string shared_timer_text = "TIME: 00:00";
 std::mutex render_mutex;
 // =========================================================================
 
-struct TrackedObject {
-    int class_id;
-    cv::Point2f center;
-    int seen_count = 0;
-    int lives = TRACK_MAX_LIVES;
-    float last_distance = -1.0f;
-    float area = 0.0f;               // площадь рамки на предыдущем подтверждении
-    float ttc = -1.0f;                // формула (3): TTC ≈ S*Δt/ΔS, -1 = не оценено
-    std::chrono::steady_clock::time_point last_update;
-};
-
-std::vector<TrackedObject> tracking_list;
-
-struct LastSpokenState {
-    int class_id = -1;
-    std::string sector = "";
-    float distance = -1.0f;
-    std::chrono::steady_clock::time_point timestamp;
-} last_spoken_state;
+// Трекинг и история озвучки инкапсулированы в NavPipeline (pipeline.h).
+NavPipeline pipeline;
 
 // Пишет кадры в output_video_{a,b}.avi по кругу: как только текущий файл
 // превышает VIDEO_MAX_BYTES, запись переключается на второй файл и затирает
@@ -335,6 +281,16 @@ void nav_status_watcher() {
             f >> c;
             is_navigating = (c == '1');
         }
+
+        std::ifstream m(MIC_OPEN_PATH);
+        if (m.is_open()) {
+            char c = '0';
+            m >> c;
+            mic_is_open = (c == '1');
+        } else {
+            mic_is_open = false;
+        }
+
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
     }
 }
@@ -359,7 +315,7 @@ void listen_button() {
                 // Мгновенно глушим предупреждения об опасности; реальную
                 // длительность подтвердит/снимет python через файл статуса.
                 is_navigating = true;
-                tracking_list.clear();
+                tracking_reset_requested = true;
                 send_start_signal();
             }
             val_file.close();
@@ -414,7 +370,6 @@ int main(int argc, char** argv) {
 
     auto program_start_time = std::chrono::steady_clock::now();
     int frame_count = 0;
-    last_spoken_state.timestamp = std::chrono::steady_clock::now();
 
     while (keep_running) {
         cv::Mat frame;
@@ -432,6 +387,12 @@ int main(int argc, char** argv) {
 
         auto start_time = std::chrono::high_resolution_clock::now();
 
+        // Сброс трекинга по нажатию кнопки выполняется здесь, в потоке-владельце
+        // пайплайна (см. tracking_reset_requested).
+        if (tracking_reset_requested.exchange(false)) {
+            pipeline.reset();
+        }
+
         // ВАЖНО: cv::VideoCapture отдаёт кадр в BGR. Конвертация в RGB выполняется
         // ОДИН раз — внутри model.infer() рядом с resize(). Раньше здесь был ещё
         // один cvtColor(BGR2RGB) до вызова infer(), а внутри infer() — такой же
@@ -447,128 +408,15 @@ int main(int argc, char** argv) {
             continue;
         }
         auto results = decode(raw_out, 512, 512, frame.cols, frame.rows, CONF_THRESHOLD_MIN);
-        results.erase(std::remove_if(results.begin(), results.end(),
-                                     [](const Detection& d) {
-                                         return d.score < conf_threshold_for(d.class_id);
-                                     }),
-                      results.end());
+        filter_by_class_threshold(results);
 
-        std::vector<RenderBox> current_boxes;
-
-        // Собираем все найденные объекты (синие рамки)
-        for (const auto& det : results) {
-            RenderBox b;
-            b.rect = cv::Rect(det.x, det.y, det.w, det.h);
-            b.label = get_class_name_en(det.class_id);
-            b.color = cv::Scalar(255, 0, 0);
-            b.thickness = 1;
-            current_boxes.push_back(b);
-        }
-
-        std::vector<bool> result_matched(results.size(), false);
+        // Трекинг, формулы (3)-(4) и решение "говорить ли сейчас" — в
+        // NavPipeline (pipeline.cpp). Тот же объект использует оффлайн-прогон
+        // записанного видео, поэтому демонстрационный ролик показывает ровно
+        // то поведение, которое будет у устройства.
         auto now_ts = std::chrono::steady_clock::now();
-
-        for (auto& track : tracking_list) {
-            bool found_match = false;
-            for (size_t i = 0; i < results.size(); ++i) {
-                if (result_matched[i]) continue;
-                if (results[i].class_id != track.class_id) continue;
-
-                cv::Point2f new_center((results[i].x + results[i].w / 2.0f) / FRAME_WIDTH,
-                                       (results[i].y + results[i].h / 2.0f) / FRAME_HEIGHT);
-
-                float dx = std::abs(new_center.x - track.center.x);
-                float dy = std::abs(new_center.y - track.center.y);
-
-                if (dx < TRACK_POS_TOLERANCE && dy < TRACK_POS_TOLERANCE) {
-                    track.center = new_center;
-                    track.seen_count++;
-                    track.lives = TRACK_MAX_LIVES;
-
-                    // Формула (3) диплома: TTC ≈ S*Δt/ΔS (эффект визуального расширения)
-                    float new_area = results[i].w * results[i].h;
-                    float dt = std::chrono::duration<float>(now_ts - track.last_update).count();
-                    track.ttc = compute_ttc(new_area, track.area, dt);
-                    track.area = new_area;
-                    track.last_update = now_ts;
-
-                    result_matched[i] = true;
-                    found_match = true;
-                    break;
-                }
-            }
-            if (!found_match) track.lives--;
-        }
-
-        tracking_list.erase(std::remove_if(tracking_list.begin(), tracking_list.end(),
-            [](const TrackedObject& t) { return t.lives <= 0; }), tracking_list.end());
-
-        for (size_t i = 0; i < results.size(); ++i) {
-            if (result_matched[i]) continue;
-            TrackedObject new_track;
-            new_track.class_id = results[i].class_id;
-            new_track.center = cv::Point2f((results[i].x + results[i].w / 2.0f) / FRAME_WIDTH,
-                                          (results[i].y + results[i].h / 2.0f) / FRAME_HEIGHT);
-            new_track.seen_count = 1;
-            new_track.area = results[i].w * results[i].h;
-            new_track.last_update = now_ts;
-            tracking_list.push_back(new_track);
-        }
-
-        float max_danger = -1.0f;
-        int best_class_id = -1;
-        float best_distance = 0.0f;
-        std::string best_sector = "прямо";
-
-        for (const auto& track : tracking_list) {
-            if (track.seen_count < PERSISTENCE_THRESHOLD) continue;
-
-            float distance = 0;
-            cv::Rect best_box;
-
-            for (const auto& det : results) {
-                if (det.class_id == track.class_id) {
-                     float H = get_real_height(det.class_id);
-                     float d = compute_distance(FOCAL_LENGTH, H, det.h);
-                     if ((det.y + det.h) < (FRAME_HEIGHT * ROI_TOP_MARGIN)) continue;
-
-                     distance = d;
-                     best_box = cv::Rect(det.x, det.y, det.w, det.h);
-                     break;
-                }
-            }
-
-            if (distance == 0 || distance > MAX_DANGER_DIST) continue;
-
-            // Если объект опасен - добавляем зеленую рамку поверх синей
-            int dist_m = static_cast<int>(distance + 0.5f);
-            RenderBox b_green;
-            b_green.rect = best_box;
-            b_green.label = get_class_name_en(track.class_id) + " " + std::to_string(dist_m) + "m";
-            b_green.color = cv::Scalar(0, 255, 0);
-            b_green.thickness = 2;
-            current_boxes.push_back(b_green);
-
-            std::string current_sector = "прямо";
-            float W_pos = 1.0f;
-
-            if (track.center.x < 0.33f) current_sector = "слева";
-            else if (track.center.x > 0.66f) current_sector = "справа";
-            else { current_sector = "прямо"; W_pos = 1.5f; }
-
-            float W_class = get_class_weight(track.class_id);
-
-            // Формула (4) диплома: S_threat = W_class * W_zone * (1/(D+eps) + k/(TTC+eps))
-            float danger_score = compute_danger_score(W_class, W_pos, distance, track.ttc,
-                                                        DIST_EPS, TTC_EPS, TTC_K);
-
-            if (danger_score > max_danger) {
-                max_danger = danger_score;
-                best_class_id = track.class_id;
-                best_distance = distance;
-                best_sector = current_sector;
-            }
-        }
+        PipelineOutput decision = pipeline.process(results, now_ts, !mic_is_open);
+        const std::vector<RenderBox>& current_boxes = decision.boxes;
 
         // =====================================================================
         // ОБНОВЛЕНИЕ ДАННЫХ ДЛЯ КАМЕРЫ
@@ -590,63 +438,35 @@ int main(int argc, char** argv) {
         }
         // =====================================================================
 
-        std::chrono::duration<float> elapsed_since_speech = current_time_sync - last_spoken_state.timestamp;
-
-        // Раньше здесь стояла проверка !is_navigating — предупреждения об
-        // опасности полностью подавлялись на время GPS-навигации. По
-        // техзаданию это неверно: предупреждение об опасности должно звучать
-        // всегда и иметь абсолютный приоритет над голосом маршрута, обрывая
-        // уже звучащую навигационную подсказку (см. pkill ниже), а не
-        // ожидая её окончания или подавляясь вовсе.
-        if (max_danger > 0) {
-            bool should_speak = false;
-
-            if (best_class_id != last_spoken_state.class_id || best_sector != last_spoken_state.sector) {
-                if (elapsed_since_speech.count() > 3.0f) should_speak = true;
-            } else {
-                if ((last_spoken_state.distance - best_distance) > 1.2f) {
-                    if (elapsed_since_speech.count() > 1.5f) should_speak = true;
-                } else {
-                    if (elapsed_since_speech.count() > 12.0f) should_speak = true;
-                }
-            }
-
-            if (should_speak) {
-                int dist_m = static_cast<int>(best_distance + 0.5f);
-                std::string text = get_class_name_ru(best_class_id) + " " + best_sector + ", " + std::to_string(dist_m) + " " + get_plural_meters(dist_m);
-
-                // Предупреждение об опасности имеет абсолютный приоритет над
-                // голосом маршрута: сначала обрываем любую уже звучащую
-                // фразу (aplay навигационной подсказки, если она есть),
-                // затем захватываем общий с nav_daemon.service flock-лок —
-                // так подсказка маршрута не звучит поверх предупреждения и
-                // не заставляет его ждать. Голос маршрута (Python, speak())
-                // симметрично никого не обрывает — только ждёт лок, поэтому
-                // приоритет всегда у предупреждения об опасности.
-                // guard перед echo ограничивает рост system_audio.raw.
-                std::string audio_log(AUDIO_LOG_PATH);
-                // Шаблон pkill намеренно не привязан к "-D default": голос
-                // маршрута (voice_nav_daemon.py, speak()) адресуется
-                // конкретному bluez-синку ("-D pulse:bluez_sink.<MAC>.<профиль>"),
-                // потому что указатель default у PulseAudio на этой плате
-                // сползает на встроенный кодек при каждой смене BT-профиля.
-                // Прежний дословный шаблон после этой правки перестал бы
-                // находить процесс, и предупреждение об опасности молча
-                // потеряло бы право обрывать навигационную подсказку.
-                std::string command = std::string("pkill -f 'aplay -D [^ ]+ -r 22050' >/dev/null 2>&1; flock ") + AUDIO_LOCK_PATH + " -c '"
-                    "[ -f " + audio_log + " ] && [ $(stat -c%s " + audio_log + ") -gt " +
-                    std::to_string(AUDIO_LOG_MAX_BYTES) + " ] && : > " + audio_log + "; "
-                    "echo \"" + text + "\" | /root/diplom-cpp/piper/piper/piper "
-                    "--model /root/diplom-cpp/piper/ru_RU-irina-medium.onnx --length_scale 0.85 --output-raw | "
-                    "tee -a " + audio_log + " | "
-                    "aplay -D default -r 22050 -f S16_LE -t raw -c 1 2>/dev/null' &";
-                std::system(command.c_str());
-
-                last_spoken_state.class_id = best_class_id;
-                last_spoken_state.sector = best_sector;
-                last_spoken_state.distance = best_distance;
-                last_spoken_state.timestamp = current_time_sync;
-            }
+        // Предупреждение об опасности имеет абсолютный приоритет над голосом
+        // маршрута: сначала обрываем любую уже звучащую фразу (aplay
+        // навигационной подсказки, если она есть), затем захватываем общий с
+        // nav_daemon.service flock-лок — так подсказка маршрута не звучит
+        // поверх предупреждения и не заставляет его ждать. Голос маршрута
+        // (Python, speak()) симметрично никого не обрывает — только ждёт лок,
+        // поэтому приоритет всегда у предупреждения об опасности.
+        //
+        // Раньше здесь стояла проверка !is_navigating — предупреждения
+        // полностью подавлялись на время GPS-навигации. По техзаданию это
+        // неверно: предупреждение об опасности должно звучать всегда.
+        if (decision.speak) {
+            // guard перед echo ограничивает рост system_audio.raw.
+            std::string audio_log(AUDIO_LOG_PATH);
+            // Шаблон pkill намеренно не привязан к "-D default": голос
+            // маршрута (voice_nav_daemon.py, speak()) адресуется конкретному
+            // bluez-синку ("-D pulse:bluez_sink.<MAC>.<профиль>"), потому что
+            // указатель default у PulseAudio на этой плате сползает на
+            // встроенный кодек при каждой смене BT-профиля. Прежний дословный
+            // шаблон после той правки перестал бы находить процесс, и
+            // предупреждение молча потеряло бы право обрывать подсказку.
+            std::string command = std::string("pkill -f 'aplay -D [^ ]+ -r 22050' >/dev/null 2>&1; flock ") + AUDIO_LOCK_PATH + " -c '"
+                "[ -f " + audio_log + " ] && [ $(stat -c%s " + audio_log + ") -gt " +
+                std::to_string(AUDIO_LOG_MAX_BYTES) + " ] && : > " + audio_log + "; "
+                "echo \"" + decision.phrase + "\" | /root/diplom-cpp/piper/piper/piper "
+                "--model /root/diplom-cpp/piper/ru_RU-irina-medium.onnx --length_scale 0.85 --output-raw | "
+                "tee -a " + audio_log + " | "
+                "aplay -D default -r 22050 -f S16_LE -t raw -c 1 2>/dev/null' &";
+            std::system(command.c_str());
         }
 
         // Сохраняем чистый кадр (без графики) для веб-стриминга (если нужно)
@@ -666,9 +486,9 @@ int main(int argc, char** argv) {
         static const bool stdout_is_tty = isatty(fileno(stdout));
         const int status_every = stdout_is_tty ? 10 : 750;  // ~0.4 с и ~30 с при 25 FPS
         if (frame_count % status_every == 0) {
-            std::string priority_info = (max_danger > 0) ? get_class_name_ru(best_class_id) : "Чисто";
+            std::string priority_info = decision.has_danger ? get_class_name_ru(decision.class_id) : "Чисто";
             std::ostringstream status;
-            status << "[Кадр " << frame_count << "] Треков: " << tracking_list.size()
+            status << "[Кадр " << frame_count << "] Треков: " << pipeline.track_count()
                    << " | Темп: " << get_temperature() << " C"
                    << " | Цель: " << priority_info
                    << " | Инференс: " << total_ms.count() << " ms";
