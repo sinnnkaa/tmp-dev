@@ -53,14 +53,62 @@ montage_one() {
     fi
 
     local capture start_epoch fps frames
-    capture="$VIDEO_DIR/$(meta_get "$meta" capture)"
+    capture=$(meta_get "$meta" capture)
     start_epoch=$(meta_get "$meta" start_epoch)
     fps=$(meta_get "$meta" fps)
     frames=$(meta_get "$meta" frames)
 
+    [ -n "$capture" ] || capture="capture_$tag.avi"
+    capture="$VIDEO_DIR/$capture"
+
     if [ ! -f "$capture" ]; then
         echo "[Монтаж] $tag: нет $capture — пропускаю"
         return 1
+    fi
+
+    # meta, не пережившая срыв питания. ext4 фиксирует переименование раньше
+    # данных, поэтому после обрыва файл читается как нули правильной длины —
+    # так потерялась прогулка 19_08_2026_3 при полностью записанном видео.
+    # Само ядро теперь сбрасывает meta на карту (SessionRecorder::write_meta),
+    # но записи, оборванные до этой правки, и любой другой повреждённый файл
+    # монтаж обязан вытянуть сам: сто мегабайт отснятой прогулки не должны
+    # пропадать из-за семи строк заголовка. Всё недостающее восстанавливается
+    # из самой записи и из метки старта микрофона.
+    if [ -z "$frames" ] || [ -z "$start_epoch" ]; then
+        echo "[Монтаж] $tag: meta повреждена — восстанавливаю по самой записи"
+
+        if [ -z "$frames" ]; then
+            # Именно счёт пакетов, а не nb_frames из заголовка: у записи,
+            # оборванной питанием, заголовок AVI дописать никто не успел.
+            frames=$(ffprobe -v error -select_streams v:0 -count_packets \
+                     -show_entries stream=nb_read_packets -of csv=p=0 \
+                     "$capture" 2>/dev/null | tr -d '\r')
+        fi
+
+        if [ -z "$start_epoch" ]; then
+            # Микрофон стартует в пределах секунды от начала отрезка, и его
+            # метка пишется отдельным файлом — она переживает обрыв чаще.
+            start_epoch=$(cat "$VIDEO_DIR/session_$tag.ambientstart" 2>/dev/null)
+        fi
+
+        # Последний рубеж: время последней записи в файл минус длительность
+        # по номинальным 30 кадрам. Точность хуже, но ролик собирается.
+        if [ -z "$start_epoch" ] && [ -n "$frames" ]; then
+            start_epoch=$(awk -v m="$(stat -c %Y "$capture")" -v n="$frames" \
+                          'BEGIN{printf "%.3f", m - n/30}')
+        fi
+
+        # fps считаем по факту: кадры за время от старта до последней записи.
+        if [ -n "$frames" ] && [ -n "$start_epoch" ]; then
+            fps=$(awk -v m="$(stat -c %Y "$capture")" -v s="$start_epoch" -v n="$frames" \
+                  'BEGIN{d=m-s; if (d>1) printf "%.6f", n/d; else print ""}')
+        fi
+
+        if [ -z "$frames" ] || [ -z "$start_epoch" ]; then
+            echo "[Монтаж] $tag: восстановить не удалось — пропускаю"
+            return 1
+        fi
+        echo "[Монтаж] $tag: восстановлено — кадров $frames, старт $start_epoch"
     fi
 
     # Отрезок короче секунды монтировать нечего: так выглядит запись,
