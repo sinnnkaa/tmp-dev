@@ -221,13 +221,28 @@ private:
     long long frames_ = 0;
     double start_epoch_ = 0.0;
 
+    // Занят ли тег. Проверять один только capture_<тег>.avi мало: смонтированную
+    // прогулку монтаж стирает, а meta, speech_<тег>/ и готовый ролик оставляет.
+    // Второй выход в тот же день после автомонтажа получал бы тот же тег и
+    // дописывал реплики в чужой speech.tsv, склеивал микрофон с прошлой
+    // прогулкой через >> и терялся для монтажа из-за уже стоящей метки
+    // .montaged — то есть готового ролика по второй прогулке не вышло бы вовсе.
+    static bool tag_taken(const std::string& tag) {
+        const std::string dir = std::string(VIDEO_DIR) + "/";
+        return path_exists(dir + "capture_" + tag + ".avi")
+            || path_exists(dir + "session_" + tag + ".meta")
+            || path_exists(dir + "speech_" + tag)
+            || path_exists(dir + "ambient_" + tag + ".mp3")
+            || path_exists(dir + "full_video_" + tag + ".mp4");
+    }
+
     bool open_new() {
         mkdir(VIDEO_DIR, 0755);
 
         std::string base = date_tag();
         tag_ = base;
         for (int n = 2; n < 1000; n++) {
-            if (!path_exists(std::string(VIDEO_DIR) + "/capture_" + tag_ + ".avi")) break;
+            if (!tag_taken(tag_)) break;
             tag_ = base + "_" + std::to_string(n);
         }
 

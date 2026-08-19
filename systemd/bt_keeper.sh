@@ -23,9 +23,22 @@ connected() {
     bluetoothctl info "$MAC" 2>/dev/null | grep -q "Connected: yes"
 }
 
+# Две настройки сервера, которые нельзя задать из voice_nav_daemon.py: они
+# относятся к загруженным модулям, а не к отдельному воспроизведению.
+#
+# Вызывается на каждом витке цикла, а не один раз при подъёме сервера. При
+# холодной загрузке платы PulseAudio стартует раньше, чем bluez успевает
+# завести module-bluetooth-policy, и разовая настройка проваливалась целиком:
+# unload-module отвечал отказом на ещё не загруженный модуль, обе правки молча
+# не применялись, а в журнале это выглядело обычным успешным стартом. Плата
+# поднималась с auto_switch=1 и живым module-suspend-on-idle — ровно с теми
+# двумя дефектами, ради которых эти строки и написаны: профиль уводило обратно
+# в A2DP и начало фраз срезал засыпающий синк. Лечилось только ручным
+# systemctl restart bt_keeper, чего на съёмках делать некому.
+# Проверки идут по факту (какие модули загружены и с какими аргументами),
+# сообщения печатаются только при реальном изменении — журнал не засоряется.
 tune_audio_server() {
-    # Две настройки сервера, которые нельзя задать из voice_nav_daemon.py:
-    # они относятся к загруженным модулям, а не к отдельному воспроизведению.
+    local policy
 
     # 1. module-bluetooth-policy идёт из /etc/pulse/default.pa с дефолтным
     #    auto_switch=1 и сам переключает профиль карты, когда на bluez-источнике
@@ -34,10 +47,13 @@ tune_audio_server() {
     #    политика могла увести карту обратно в A2DP — отсюда наблюдавшееся
     #    "a2dp иногда звучит как hfp" и срабатывание сигнала через раз.
     #    Переключение остаётся ровно одно, явное, из демона.
-    if pactl unload-module module-bluetooth-policy 2>/dev/null; then
-        pactl load-module module-bluetooth-policy auto_switch=false >/dev/null 2>&1 \
-            && echo "[BT Keeper] module-bluetooth-policy: auto_switch=false" \
-            || echo "[BT Keeper] ВНИМАНИЕ: module-bluetooth-policy не поднялся обратно."
+    policy=$(pactl list short modules 2>/dev/null | grep 'module-bluetooth-policy')
+    if [ -n "$policy" ] && ! printf '%s' "$policy" | grep -q 'auto_switch=false'; then
+        if pactl unload-module module-bluetooth-policy 2>/dev/null; then
+            pactl load-module module-bluetooth-policy auto_switch=false >/dev/null 2>&1 \
+                && echo "[BT Keeper] module-bluetooth-policy: auto_switch=false" \
+                || echo "[BT Keeper] ВНИМАНИЕ: module-bluetooth-policy не поднялся обратно."
+        fi
     fi
 
     # 2. module-suspend-on-idle усыпляет синк через несколько секунд тишины.
@@ -48,8 +64,10 @@ tune_audio_server() {
     #    засыпает вовсе, линк остаётся тёплым, начало фраз не режется.
     #    Цена — гарнитура постоянно принимает поток и садится быстрее; для
     #    носимого устройства на съёмках это приемлемый размен.
-    pactl unload-module module-suspend-on-idle 2>/dev/null \
-        && echo "[BT Keeper] module-suspend-on-idle выгружен (звук не засыпает)."
+    if pactl list short modules 2>/dev/null | grep -q 'module-suspend-on-idle'; then
+        pactl unload-module module-suspend-on-idle 2>/dev/null \
+            && echo "[BT Keeper] module-suspend-on-idle выгружен (звук не засыпает)."
+    fi
 }
 
 start_audio_server() {
@@ -112,6 +130,11 @@ while true; do
         next_attempt=0
         state=""
     fi
+
+    # Настройки модулей проверяются на каждом витке: bluez заводит
+    # module-bluetooth-policy не сразу после старта сервера, а при появлении
+    # адаптера, и на холодной загрузке это происходит уже после подъёма звука.
+    audio_alive && tune_audio_server
 
     if connected; then
         # Пишем только смену состояния: иначе журнал забивается строками
