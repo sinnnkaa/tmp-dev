@@ -42,13 +42,29 @@ fi
 DEV=$(voice_playback_device)
 SINK=${DEV#pulse:}
 
+# Без этой проверки скрипт молча играл в динамик платы. voice_playback_device
+# при отсутствии bluez-синка отдаёт "default", а default на этой плате —
+# встроенный кодек rk809. Для боевой озвучки такой запасной выход осмыслен
+# (звук уйдёт хоть куда-то), а для разбора качества в наушниках он означает
+# три прогона тишины и ни одного слова о причине.
+if [ "$DEV" = "default" ]; then
+    echo "Гарнитуры нет: PulseAudio не показывает ни одного bluez-синка." >&2
+    echo "Играть в встроенный динамик платы смысла нет — включите наушники и" >&2
+    echo "дождитесь, пока bt_keeper их подхватит:" >&2
+    echo "    journalctl -u bt_keeper -f" >&2
+    echo "    pactl list sinks short" >&2
+    exit 1
+fi
+
 echo "=== Обстановка ==="
 echo "Файл:      $SRC ($(stat -c %s "$SRC") байт, $(awk -v b="$(stat -c %s "$SRC")" -v r="$PIPER_RATE" 'BEGIN{printf "%.1f", b/2/r}') с)"
 echo "Устройство: $DEV"
 echo
 echo "-- синк --"
+# Volume и Mute здесь не для красоты: приглушённый синк — самое частое
+# объяснение "звука нет", а выглядит оно неотличимо от поломки тракта.
 pactl list sinks 2>/dev/null | grep -A 20 "Name: $SINK" \
-    | grep -E "Name:|State:|Sample Specification:|Latency:" | sed 's/^/   /'
+    | grep -E "Name:|State:|Sample Specification:|Latency:|Volume:|Mute:" | sed 's/^/   /'
 echo
 echo "-- ресемплер --"
 # Если speex-float-1 в списке нет, дефолт сервера молча становится trivial.
@@ -78,9 +94,39 @@ announce() {
     return 0
 }
 
+# Прогон без отчёта о коде возврата — это тот же молчаливый отказ, ради поиска
+# которого скрипт и написан. aplay умеет завершиться с ошибкой мгновенно и
+# выглядеть при этом как "проиграли, но не слышно".
+played() {
+    local rc=$1 secs=$2
+    if [ "$rc" -eq 0 ]; then
+        printf '    готово за %s с (код 0)\n' "$secs"
+    else
+        printf '    ОТКАЗ: код %s за %s с — звука не было, ищите причину выше\n' "$rc" "$secs"
+    fi
+}
+
+run_and_report() {
+    local start end
+    start=$(date +%s.%N)
+    "$@"
+    local rc=$?
+    end=$(date +%s.%N)
+    played "$rc" "$(awk -v a="$start" -v b="$end" 'BEGIN{printf "%.1f", b-a}')"
+}
+
+# --- 0. Контрольный: тот самый say.sh -------------------------------------
+# Нулевой прогон отвечает на вопрос "а вообще что-нибудь играет?". Он идёт
+# через боевой скрипт целиком, вместе с flock и кэшем, то есть через путь,
+# который на этой плате точно работал. Если тишина уже здесь — дело не в
+# формате и не в ресемплере, и остальные прогоны слушать незачем.
+if announce "Прогон 0 из 4. КОНТРОЛЬНЫЙ: боевой say.sh целиком."; then
+    run_and_report "$BLINDNAV_ROOT/tools/say.sh" "Камера не видит"
+fi
+
 # --- 1. Боевой путь -------------------------------------------------------
-if announce "Прогон 1 из 4. БОЕВОЙ ПУТЬ: 22050 моно, пересчёт в сервере."; then
-    aplay -D "$DEV" -r "$PIPER_RATE" -f S16_LE -t raw -c 1 "$SRC"
+if announce "Прогон 1 из 4. ТОТ ЖЕ ПУТЬ БЕЗ ОБВЯЗКИ: 22050 моно, пересчёт в сервере."; then
+    run_and_report aplay -D "$DEV" -r "$PIPER_RATE" -f S16_LE -t raw -c 1 "$SRC"
 fi
 
 # --- 2. Без пересчёта -----------------------------------------------------
@@ -90,7 +136,7 @@ if announce "Прогон 2 из 4. БЕЗ ПЕРЕСЧЁТА: заранее в
     if ffmpeg -nostdin -hide_banner -loglevel error -y \
               -f s16le -ar "$PIPER_RATE" -ac 1 -i "$SRC" \
               -ar 44100 -ac 2 -f s16le "$TMP/44.raw"; then
-        aplay -D "$DEV" -r 44100 -f S16_LE -t raw -c 2 "$TMP/44.raw"
+        run_and_report aplay -D "$DEV" -r 44100 -f S16_LE -t raw -c 2 "$TMP/44.raw"
     else
         echo "    ffmpeg не справился — прогон пропущен."
     fi
@@ -104,13 +150,13 @@ if announce "Прогон 3 из 4. ДЛИННЫЙ ПОТОК: десять ре
     ls -S "$VOICE_CACHE_DIR"/*.raw 2>/dev/null | head -10 | while read -r f; do
         cat "$f" >> "$TMP/long.raw"
     done
-    aplay -D "$DEV" -r "$PIPER_RATE" -f S16_LE -t raw -c 1 "$TMP/long.raw"
+    run_and_report aplay -D "$DEV" -r "$PIPER_RATE" -f S16_LE -t raw -c 1 "$TMP/long.raw"
 fi
 
 # --- 4. Мимо alsa-плагина -------------------------------------------------
 if announce "Прогон 4 из 4. НАПРЯМУЮ В СЕРВЕР: paplay вместо aplay."; then
     if command -v paplay >/dev/null 2>&1; then
-        paplay --raw --rate="$PIPER_RATE" --channels=1 --format=s16le \
+        run_and_report paplay --raw --rate="$PIPER_RATE" --channels=1 --format=s16le \
                --device="$SINK" "$SRC"
     else
         echo "    paplay не установлен — прогон пропущен."
@@ -120,6 +166,9 @@ fi
 cat <<'EOF'
 
 === Как читать результат ===
+  0 молчит                  -> проблема не в формате звука. Смотреть код
+                               возврата say.sh, громкость синка (Volume/Mute
+                               в шапке) и журнал bt_keeper.
   2 чище 1                  -> виноват пересчёт частоты. Лечится тем, что кэш
                                собирается сразу в 44100 (правка на две строки
                                в build_voice_cache.sh и say.sh).
