@@ -365,6 +365,55 @@ class NavigationWorkerTests(SilentAudioTestCase):
         mock_speak.assert_any_call("Вы достигли пункта назначения. Навигация завершена.", sync=True)
 
 
+class MicProfileReadyTests(SilentAudioTestCase):
+    """Неудачное переключение в HFP не должно оборачиваться диктовкой в
+    микрофон вебкамеры.
+
+    Возврат switch_bt_profile игнорировался во всех пяти местах вызова. Самое
+    дорогое из них — прямо перед listen_and_transcribe: гарнитура осталась в
+    A2DP, источника bluez_source не существует, захват уходит на микрофон
+    вебкамеры, а человек в это время слышит сигнал готовности и диктует адрес.
+    """
+
+    @mock.patch("voice_nav_daemon.speak")
+    @mock.patch("voice_nav_daemon.switch_bt_profile", return_value=True)
+    def test_true_when_profile_confirmed(self, mock_switch, _speak):
+        self.assertTrue(vnd.mic_profile_ready())
+        mock_switch.assert_called_once_with("handsfree_head_unit")
+
+    @mock.patch("voice_nav_daemon.speak")
+    @mock.patch("voice_nav_daemon.switch_bt_profile", return_value=False)
+    def test_returns_to_a2dp_and_reports_failure(self, mock_switch, mock_speak):
+        self.assertFalse(vnd.mic_profile_ready())
+        self.assertEqual(
+            [c.args[0] for c in mock_switch.call_args_list],
+            ["handsfree_head_unit", "a2dp_sink"],
+        )
+        mock_speak.assert_called_once_with("Микрофон гарнитуры не готов", sync=True)
+
+    @mock.patch("voice_nav_daemon.write_nav_status")
+    @mock.patch("voice_nav_daemon.time.sleep")
+    @mock.patch("voice_nav_daemon.speak")
+    @mock.patch("voice_nav_daemon.mic_profile_ready", return_value=False)
+    @mock.patch("voice_nav_daemon.listen_and_transcribe", return_value="ленина двадцать пять")
+    def test_navigation_worker_does_not_listen(self, mock_listen, _ready, _speak, _sleep, _status):
+        vnd.NAV_ACTIVE = True
+        db = {"ленина 25": (59.9, 30.3)}
+        vnd.navigation_worker(mock.MagicMock(), db, list(db.keys()))
+        self.assertFalse(vnd.NAV_ACTIVE)
+        mock_listen.assert_not_called()
+        self.mock_ready_tone.assert_not_called()
+
+    @mock.patch("voice_nav_daemon.time.sleep")
+    @mock.patch("voice_nav_daemon.speak")
+    @mock.patch("voice_nav_daemon.mic_profile_ready", return_value=False)
+    @mock.patch("voice_nav_daemon.listen_and_transcribe", return_value="да")
+    def test_confirm_address_is_not_granted(self, mock_listen, _ready, _speak, _sleep):
+        self.assertFalse(vnd.confirm_address(mock.MagicMock(), "Ленина 25"))
+        mock_listen.assert_not_called()
+        self.mock_ready_tone.assert_not_called()
+
+
 class SharedConstantsTests(unittest.TestCase):
     """Значения, продублированные в двух языках, обязаны совпадать.
 

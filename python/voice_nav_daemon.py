@@ -414,6 +414,31 @@ def speak(text, sync=False):
     return True
 
 
+def mic_profile_ready():
+    """Переводит гарнитуру в HFP и честно отвечает, состоялся ли переход.
+
+    Возврат switch_bt_profile до этого игнорировался во всех пяти местах. Там,
+    где профиль возвращается в A2DP, это терпимо: фраза просто прозвучит в
+    неподходящем режиме. А здесь неудача означает, что микрофон гарнитуры не
+    активирован — и listen_and_transcribe запишет микрофон вебкамеры. Тот
+    висит на груди, слышит улицу, и нечёткий поиск подтянет получившийся мусор
+    к какому-нибудь адресу: маршрут построится не туда, причём молча.
+
+    Хуже того, сразу за переключением звучал сигнал готовности. Устройство
+    сообщало "микрофон слушает" именно в тот момент, когда он не слушал.
+    Поэтому при неудаче диктовка не начинается вовсе: возвращаемся в A2DP,
+    говорим об отказе и отдаём False вызывающему.
+    """
+    if switch_bt_profile("handsfree_head_unit"):
+        return True
+
+    # Сначала обратно в A2DP, потом фраза: в подтверждённом профиле у неё
+    # больше шансов быть услышанной, чем в том, который только что не удался.
+    switch_bt_profile("a2dp_sink")
+    speak("Микрофон гарнитуры не готов", sync=True)
+    return False
+
+
 def normalize_text(text):
     fillers = ["улица", "ул", "проспект", "пр", "дом", "д", "бульвар", "набережная", "переулок"]
     words = text.lower().split()
@@ -565,7 +590,10 @@ def confirm_address(model, address_name):
     """Голосовое подтверждение найденного адреса перед стартом маршрута — защита
     от того, что нечёткий поиск (Левенштейн/difflib) подберёт похожий, но не тот адрес."""
     speak(f"Вы имели в виду {address_name}? Скажите да или нет.", sync=True)
-    switch_bt_profile("handsfree_head_unit")
+    if not mic_profile_ready():
+        # Подтверждения не было — считаем адрес неподтверждённым, вызывающий
+        # скажет "Хорошо, отменяю" и не поведёт человека по случайному адресу.
+        return False
     play_ready_tone()
 
     answer = listen_and_transcribe(model, 4)
@@ -583,7 +611,10 @@ def navigation_worker(model, addresses_db, address_keys):
     global NAV_ACTIVE
 
     speak("Слушаю адрес", sync=True)
-    switch_bt_profile("handsfree_head_unit")
+    if not mic_profile_ready():
+        NAV_ACTIVE = False
+        write_nav_status(False)
+        return
     play_ready_tone()
 
     print("[STT] Говорите...")
