@@ -414,6 +414,36 @@ class MicProfileReadyTests(SilentAudioTestCase):
         self.mock_ready_tone.assert_not_called()
 
 
+class CaptureDeviceTests(unittest.TestCase):
+    """Распознавание речи слушает только гарнитуру.
+
+    Микрофон вебкамеры висит на груди и снимает улицу; для фоновой дорожки
+    прогулки это то, что нужно, а для диктовки адреса — мусор, который
+    нечёткий поиск всё равно к какому-нибудь адресу подтянет. Прежний возврат
+    "default" делал такую подмену молча, потому что default source на плате —
+    как раз вебкамера.
+    """
+
+    @mock.patch("voice_nav_daemon.bt_device_name", return_value="bluez_source.XX.handsfree_head_unit")
+    def test_returns_headset_source(self, mock_name):
+        self.assertEqual(vnd.capture_device(), "bluez_source.XX.handsfree_head_unit")
+        mock_name.assert_called_once_with("source")
+
+    @mock.patch("voice_nav_daemon.bt_device_name", return_value=None)
+    def test_no_headset_means_no_source(self, _name):
+        self.assertIsNone(vnd.capture_device())
+
+    @mock.patch("voice_nav_daemon.write_mic_open")
+    @mock.patch("voice_nav_daemon.subprocess.Popen")
+    @mock.patch("voice_nav_daemon.capture_device", return_value=None)
+    def test_listen_refuses_to_record_without_headset(self, _dev, mock_popen, mock_flag):
+        self.assertEqual(vnd.listen_and_transcribe(mock.MagicMock(), 4), "")
+        mock_popen.assert_not_called()
+        # Флаг "микрофон открыт" не должен даже подниматься: пока он поднят,
+        # C++ ядро откладывает предупреждения об опасности, то есть молчит.
+        mock_flag.assert_not_called()
+
+
 class SharedConstantsTests(unittest.TestCase):
     """Значения, продублированные в двух языках, обязаны совпадать.
 
