@@ -11,6 +11,22 @@ StartLimitBurst=5
 Type=simple
 User=root
 Environment=PULSE_RUNTIME_PATH=/run/user/0/pulse
+
+# Право на планирование в реальном времени для PulseAudio. Сервер поднимается
+# из bt_keeper.sh и живёт в cgroup этого юнита, то есть наследует его лимиты, а
+# systemd по умолчанию ставит RLIMIT_RTPRIO=0.
+#
+# Зачем вообще: кодек A2DP считается в самом pulseaudio и обязан отдавать
+# пакеты по часам гарнитуры, буфер синка — десятки миллисекунд. Под нагрузкой
+# (распознавание, запись видео, кодирование звука) обычный SCHED_OTHER не
+# успевает, буфер пустеет, и в наушнике это хруст с провалами — который легко
+# списать на плохой bluetooth или севшие наушники.
+#
+# Замер на плате: с одними флагами --realtime --high-priority приоритет nice
+# опускался до -11, а класс планирования у всех потоков оставался TS. Путь
+# через rtkit у сервера закрыт (в журнале "Unable to contact D-Bus ... without
+# a $DISPLAY"), поэтому остаётся только прямой вызов, а ему нужен лимит.
+LimitRTPRIO=20
 ExecStart=/bin/bash /root/bt_keeper.sh
 Restart=always
 RestartSec=5
