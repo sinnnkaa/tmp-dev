@@ -19,6 +19,21 @@ audio_alive() {
     pactl info >/dev/null 2>&1
 }
 
+# Получил ли сервер приоритет реального времени.
+#
+# Кодек A2DP (SBC) считается в самом процессе pulseaudio, и отдавать пакеты он
+# обязан по часам гарнитуры: буфер синка — десятки миллисекунд. С обычным
+# SCHED_OTHER сервер стоит в общей очереди с распознаванием, записью видео и
+# кодированием звука, и любой промах планировщика — это опустевший буфер, то
+# есть хруст и провалы в наушнике. Замер на плате: pulseaudio шёл
+# SCHED_OTHER с приоритетом 0.
+audio_is_realtime() {
+    local pid
+    pid=$(pgrep -x pulseaudio | head -1)
+    [ -n "$pid" ] || return 1
+    chrt -p "$pid" 2>/dev/null | grep -qE 'SCHED_(RR|FIFO)'
+}
+
 connected() {
     bluetoothctl info "$MAC" 2>/dev/null | grep -q "Connected: yes"
 }
@@ -85,7 +100,16 @@ start_audio_server() {
     # bluez отвечал br-connection-profile-unavailable. Флаг задан здесь, а не
     # в /etc/pulse/daemon.conf, чтобы настройка лежала в репозитории и уезжала
     # вместе с проектом, а не жила невидимо в системе.
-    pulseaudio --start --exit-idle-time=-1
+    # --realtime и --high-priority — по той же причине, по которой звук вообще
+    # доверен PulseAudio, а не сырому ALSA: поток в гарнитуру должен уходить
+    # вовремя. Без них сервер идёт SCHED_OTHER, и на загруженной плате буфер
+    # A2DP успевает опустеть между двумя порциями — в наушнике это хруст и
+    # прерывания, которые легко принять за плохой bluetooth или севшие
+    # наушники. Флаги стоят здесь, а не в /etc/pulse/daemon.conf, ровно как и
+    # --exit-idle-time: настройка должна уезжать вместе с репозиторием, а не
+    # жить невидимо в системе. Право на RT-приоритет даёт CAP_SYS_NICE, юнит
+    # работает под root — отдельных правок limits.conf не нужно.
+    pulseaudio --start --exit-idle-time=-1 --realtime --high-priority
 
     # Ждём реальной готовности вместо фиксированного sleep (до ~10 секунд)
     for i in $(seq 1 20); do
@@ -95,6 +119,14 @@ start_audio_server() {
 
     if audio_alive; then
         echo "[BT Keeper] Аудиосервер поднят."
+        # Флаг мог не сработать (ядро без RT-политик, урезанные capabilities).
+        # Отказ здесь тихий: звук есть, просто рвётся — как раз тот случай,
+        # когда причину потом ищут в наушниках и в блютусе.
+        if audio_is_realtime; then
+            echo "[BT Keeper] Приоритет реального времени получен."
+        else
+            echo "[BT Keeper] ВНИМАНИЕ: сервер идёт без RT-приоритета — возможен хруст в A2DP." >&2
+        fi
         # Обычно модули уже подняты из default.pa — тогда pactl откажется и это
         # нормально. Вызов нужен для случая, когда default.pa их не завёл.
         pactl load-module module-bluetooth-discover 2>/dev/null
@@ -114,6 +146,17 @@ state=""
 # start_audio_server ниже не вызовется и настройки модулей не применятся.
 # Применяем их к уже живому серверу: обе операции идемпотентны.
 audio_alive && tune_audio_server
+
+# Сервер, переживший перезапуск keeper'а, поднимался прежней командой и мог
+# остаться без RT-приоритета. Сам keeper его не тронет: start_audio_server
+# вызывается только когда сервера нет, поэтому одного systemctl restart для
+# применения флагов НЕ достаточно — сервер надо снять. Делать это отсюда
+# нельзя, звук оборвался бы посреди прогулки; поэтому просто говорим, что и как.
+if audio_alive && ! audio_is_realtime; then
+    echo "[BT Keeper] ВНИМАНИЕ: сервер работает без RT-приоритета — возможен хруст в A2DP." \
+         "Он поднят до этой правки. Применить (когда прогулка не идёт):" \
+         "systemctl stop bt_keeper && killall pulseaudio && systemctl start bt_keeper" >&2
+fi
 
 echo "[BT Keeper] Вход в цикл мониторинга..."
 while true; do

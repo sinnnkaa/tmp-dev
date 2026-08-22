@@ -11,7 +11,7 @@ from vosk import Model, KaldiRecognizer
 
 # Тексты, произносимые по шаблону, живут отдельным модулем без зависимостей —
 # из него же их берёт сборщик кэша озвучки (tools/build_voice_cache.sh).
-from phrases import TURN_ANNOUNCE_MAX_DIST, plural_meters, turn_phrase
+from phrases import TURN_ANNOUNCE_MAX_DIST, is_announced, plural_meters, turn_phrase
 
 try:
     import gps
@@ -220,10 +220,22 @@ def capture_device():
 def bind_defaults_to_bt():
     """Прибивает default sink/source сервера к гарнитуре после смены профиля.
 
-    Нужно не для самого демона (он адресуется по имени, см. playback_device),
-    а для C++ ядра: предупреждения об опасности в main.cpp играются через
-    `aplay -D default` из std::system и имени синка не знают. Без этого вызова
-    они уходят туда же, куда уполз default — в динамик платы.
+    Прежнее обоснование этой функции («C++ ядро играет через aplay -D default
+    и имени синка не знает») больше не соответствует коду: ядро зовёт
+    tools/say.sh, а тот спрашивает синк у сервера сам (voice_playback_device).
+    Ни один потребитель проекта на указатель default уже не опирается.
+
+    Функция всё же оставлена, и вот зачем. set-card-profile уничтожает синк
+    старого профиля и создаёт новый, а module-default-device-restore при этом
+    возвращает указатель на встроенный кодек платы. Всё, что запускается на
+    плате мимо нашего кода — ручная проверка через aplay/paplay, ffmpeg из
+    записи прогулки, любой сторонний клиент, — попадёт в динамик платы, и
+    выглядеть это будет как «звука в наушниках нет», хотя гарнитура
+    подключена. Держать указатель в осмысленном состоянии дешевле, чем
+    объяснять этот симптом каждый раз заново.
+
+    Второе действие функции, снятие засыпания с синка, к указателю отношения
+    не имеет и нужно по-настоящему (см. комментарий ниже).
     """
     env = pulse_env()
     for kind, setter in (("sink", "set-default-sink"), ("source", "set-default-source")):
@@ -375,15 +387,31 @@ def speak(text, sync=False):
     Команда передаётся списком без shell: flock умеет запускать программу
     напрямую, поэтому текст фразы не проходит ни через одну стадию разбора
     оболочкой и не нуждается в экранировании.
+
+    При sync=True проверяется код возврата say.sh: ненулевой означает, что
+    звука не было вообще — гарнитура отвалилась, синк исчез, устройство занято.
+    Раньше проверять было нечего (say.sh всегда возвращал успех), и отказ
+    озвучки выглядел как обычная работа. Все ответственные реплики демона —
+    подтверждение адреса, отмена, прибытие — идут именно с sync=True.
+
+    Возвращает True, если фраза прозвучала. При sync=False результата ещё не
+    существует: процесс только запущен, и ждать его здесь нельзя — это цикл
+    навигации. Такой вызов возвращает True как "запущено без ошибки", а сам
+    отказ, если он случится, останется в журнале от say.sh.
     """
     print(f"[Голос]: {text}")
     cmd = ["flock", AUDIO_LOCK_PATH, SAY_SCRIPT, text, "nav"]
     custom_env = pulse_env()
 
-    if sync:
-        subprocess.run(cmd, env=custom_env)
-    else:
+    if not sync:
         subprocess.Popen(cmd, env=custom_env)
+        return True
+
+    rc = subprocess.run(cmd, env=custom_env).returncode
+    if rc != 0:
+        print(f"[Голос] ФРАЗА НЕ ПРОЗВУЧАЛА (код {rc}): {text}")
+        return False
+    return True
 
 
 def normalize_text(text):
@@ -648,7 +676,11 @@ def navigation_worker(model, addresses_db, address_keys):
             loc = maneuver.get("location", [0,0])
             loc_str = f"{loc[0]},{loc[1]}"
 
-            if direction not in ["straight", "slight left", "slight right"]:
+            # Список молчаливых манёвров живёт в phrases.py вместе с самими
+            # формулировками: пока он был выписан здесь строкой, сборщик кэша
+            # об этом не знал и заранее синтезировал девять десятков фраз,
+            # которые устройство не произносит.
+            if is_announced(direction):
                 if step_dist < TURN_ANNOUNCE_MAX_DIST and loc_str != last_announced_loc:
                     speak(turn_phrase(step_dist, direction), sync=True)
                     last_announced_loc = loc_str # Запоминаем, что уже сказали

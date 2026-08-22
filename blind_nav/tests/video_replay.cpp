@@ -177,7 +177,7 @@ int main(int argc, char** argv) {
     std::map<int, int> class_counts;
     int out_frames = 0;
     int spoken = 0;
-    int clipped_rejected = 0;
+    int dropped_by_bounds = 0;
     int total_dets = 0;
     std::string last_subtitle;
     double last_subtitle_until = -1.0;
@@ -208,7 +208,7 @@ int main(int argc, char** argv) {
         }
 
         auto results = decode(raw_out, 512, 512, frame.cols, frame.rows, CONF_THRESHOLD_MIN,
-                              &clipped_rejected);
+                              &dropped_by_bounds);
         filter_by_class_threshold(results);
         total_dets += static_cast<int>(results.size());
         for (const auto& d : results) class_counts[d.class_id]++;
@@ -257,7 +257,7 @@ int main(int argc, char** argv) {
     std::cout << "Реальное время прогона: " << wall.count() << " с ("
               << (wall.count() > 0 ? out_frames / wall.count() : 0.0) << " кадр/с на этой плате)\n";
     std::cout << "Детекций после порогов: " << total_dets << "\n";
-    std::cout << "Отброшено фильтром границ кадра в decode(): " << clipped_rejected << "\n";
+    std::cout << "Отброшено фильтром границ кадра в decode(): " << dropped_by_bounds << "\n";
     std::cout << "Реплик озвучено: " << spoken << "\n";
     std::cout << "По классам:\n";
     for (const auto& kv : class_counts) {

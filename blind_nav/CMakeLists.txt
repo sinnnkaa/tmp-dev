@@ -30,6 +30,7 @@ add_executable(blind_nav
     src/decode.cpp
     src/threat_logic.cpp
     src/pipeline.cpp
+    src/device_phrases.cpp
 )
 
 target_link_libraries(blind_nav
@@ -125,6 +126,7 @@ if(BUILD_VOICE_PHRASES)
         src/threat_logic.cpp
         src/pipeline.cpp
         src/decode.cpp
+        src/device_phrases.cpp
     )
     target_include_directories(voice_phrases PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(voice_phrases ${OpenCV_LIBS})

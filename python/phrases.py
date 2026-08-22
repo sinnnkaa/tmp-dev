@@ -25,6 +25,28 @@ _DIRECTIONS = {
     "uturn": "развернитесь",
 }
 
+ALL_DIRECTIONS = tuple(_DIRECTIONS)
+
+# Манёвры, о которых демон молчит: идти дальше примерно туда же — не событие,
+# а объявлять его каждые несколько метров значит забивать эфир, в котором
+# должны быть слышны предупреждения об опасности.
+#
+# Список живёт здесь, а не строкой в navigation_worker, ровно по той же
+# причине, по которой сюда вынесены сами формулировки: пока он был выписан
+# только в демоне, сборщик кэша перебирал все восемь направлений и синтезировал
+# девяносто реплик, которых устройство не произносит ни при каких условиях.
+# Молча — то есть модуль, объявивший своей целью не допустить расхождения кэша
+# с речью, сам его и содержал.
+SILENT_DIRECTIONS = ("straight", "slight left", "slight right")
+
+# То, что реально звучит. Отсюда берут и фильтр в демоне, и сборщик кэша.
+ANNOUNCED_DIRECTIONS = tuple(d for d in ALL_DIRECTIONS if d not in SILENT_DIRECTIONS)
+
+
+def is_announced(direction):
+    """Объявляет ли демон этот манёвр вслух."""
+    return direction in ANNOUNCED_DIRECTIONS
+
 
 def plural_meters(n):
     """Склонение слова "метр" — та же логика, что в get_plural_meters()
@@ -50,10 +72,13 @@ def turn_phrase(distance_m, direction):
 def cacheable_phrases():
     """Все фразы демона, текст которых известен заранее.
 
+    Перебираются только объявляемые манёвры (ANNOUNCED_DIRECTIONS): фразы для
+    остальных синтезировались бы впустую.
+
     Фразы с названием улицы сюда не попадают: множество адресов не ограничено,
     да и звучат они, когда человек стоит на месте, — задержка синтеза там не
     стоит на пути.
     """
-    for direction in _DIRECTIONS:
+    for direction in ANNOUNCED_DIRECTIONS:
         for distance_m in range(TURN_ANNOUNCE_MAX_DIST):
             yield turn_phrase(distance_m, direction)

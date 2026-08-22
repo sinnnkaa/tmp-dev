@@ -18,12 +18,15 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <sys/statvfs.h>
+#include <sys/wait.h>
 #include <ctime>
+#include <iomanip>
 #include <opencv2/opencv.hpp>
 #include "rknn_inference.h"
 #include "decode.h"
 #include "threat_logic.h"
 #include "pipeline.h"
+#include "device_phrases.h"
 
 // Константы пайплайна (фокусное, пороги классов, параметры трекинга и
 // коэффициенты формулы (4)) живут в pipeline.cpp — их разделяет с этим
@@ -82,6 +85,48 @@ const long VIDEO_SEGMENT_MAX_BYTES = 500L * 1024 * 1024;
 // перестают писаться и tmpfs-флаги, и журналы, и лог озвучки. Видео —
 // вспомогательная функция, она обязана уступить первой.
 const long VIDEO_MIN_FREE_BYTES = 2L * 1024 * 1024 * 1024;
+
+// Как часто ядро отмечает в session_<тег>.frames, какой кадр когда снят.
+//
+// Реальный темп камеры за прогулку плавает — на записи 19.08.2026 он прошёл от
+// 14.4 до 16.2 кадра/с, — а монтаж переклеивал всю запись под один постоянный
+// fps из meta. К концу той прогулки звук разъехался с картинкой на 23 секунды:
+// предупреждение «бордюр прямо» звучало через двадцать секунд после того, как
+// бордюр проехал по кадру. Одного среднего fps для этого мало в принципе,
+// нужна отметка времени по ходу записи. Раз в 30 кадров — это строка раз в две
+// секунды, около четырёхсот строк на прогулку.
+const long FRAME_STAMP_EVERY = 30;
+
+// --- Сторож «кадры идут, а картинки в них нет» -----------------------------
+//
+// Отказ 19.08.2026: вебкамера мгновенно, между двумя соседними кадрами, начала
+// отдавать равномерно-чёрные MJPG — и делала это ещё 7 минут 44 секунды, с тем
+// же темпом, валидными кадрами и без единой ошибки USB в ядре. Проверка
+// temp_frame.empty() отвечает на вопрос «вернул ли read() буфер», а не «есть
+// ли в буфере изображение», поэтому не заметила ничего: устройство молча
+// перестало предупреждать о препятствиях, а человек продолжал идти и ещё
+// дважды пытался строить маршрут, не зная, что зрения у него больше нет.
+//
+// Смотрим на разброс яркости, а не на её среднее: у живой картинки разброс не
+// бывает нулевым даже ночью — шум сенсора и блочность JPEG никуда не деваются,
+// — а у равномерной заливки он ровно ноль, каким бы ни был её цвет. Порог с
+// запасом ниже любого реального кадра.
+const double CAMERA_BLANK_STDDEV = 1.5;
+
+// Сколько подряд пустых кадров терпеть, прежде чем объявить отказ. Секунда-две
+// однотонного кадра — это нормально (небо в объективе, стена вплотную);
+// четыре секунды подряд у идущего человека — уже нет.
+const float CAMERA_BLANK_TIMEOUT_SEC = 4.0f;
+
+// Как часто повторять сообщение, пока камера не видит. Человек в этот момент
+// идёт и слушает улицу — первую фразу он мог просто не разобрать, а молчание
+// прибора неотличимо от «вокруг чисто».
+const float CAMERA_BLIND_REANNOUNCE_SEC = 30.0f;
+
+// Как часто пытаться оживить ослепшую камеру и после скольких безуспешных
+// переоткрытий переходить к ресету USB-порта.
+const float CAMERA_RECOVERY_INTERVAL_SEC = 15.0f;
+const int CAMERA_REOPEN_TRIES_BEFORE_USB_RESET = 2;
 
 std::atomic<bool> keep_running(true);
 
@@ -176,6 +221,8 @@ public:
         writer_.write(frame);
         frames_++;
 
+        if (frames_ % FRAME_STAMP_EVERY == 0) write_stamp();
+
         // Проверки раз в ~секунду, а не на каждом кадре: stat/statvfs на
         // SD-карте стоят заметно дороже самой записи кадра.
         if (frames_ % 30 != 0) return;
@@ -221,6 +268,7 @@ private:
     std::string capture_path_;
     long long frames_ = 0;
     double start_epoch_ = 0.0;
+    std::ofstream stamps_;
 
     // Занят ли тег. Проверять один только capture_<тег>.avi мало: смонтированную
     // прогулку монтаж стирает, а meta, speech_<тег>/ и готовый ролик оставляет.
@@ -264,14 +312,36 @@ private:
 
         frames_ = 0;
         start_epoch_ = epoch_now();
+
+        // Летопись «кадр N снят в момент T» для монтажа (см. FRAME_STAMP_EVERY).
+        stamps_.close();
+        stamps_.clear();
+        stamps_.open(std::string(VIDEO_DIR) + "/session_" + tag_ + ".frames", std::ios::trunc);
+        write_stamp();
+
         write_meta(false);
         publish_tag(tag_);
         std::cerr << "[Запись] Пишу " << capture_path_ << std::endl;
         return true;
     }
 
+    // Отметка «кадр N снят в момент T». Сбрасывается на карту сразу: прогулка
+    // может кончиться срывом питания, и недописанный хвост летописи стоит
+    // ровно столько же, сколько её отсутствие. Строка короткая, раз в две
+    // секунды — против записи самих кадров это ничто.
+    void write_stamp() {
+        if (!stamps_.is_open()) return;
+        stamps_ << frames_ << " " << std::fixed << std::setprecision(3) << epoch_now() << "\n";
+        stamps_.flush();
+    }
+
     void finalize() {
         if (writer_.isOpened()) writer_.release();
+        // Последняя отметка: без неё хвост отрезка от предыдущей отметки до
+        // конца записи остался бы без времени, и монтаж досчитывал бы его по
+        // среднему — то самое, от чего летопись и заводилась.
+        write_stamp();
+        stamps_.close();
         // Отдельного маркера "отрезок закрыт" рядом нет намеренно: закрытость
         // видна по final=1 в самой meta, а монтаж и без него знает, какой
         // отрезок пишется прямо сейчас — по /dev/shm/nav_session. Файл,
@@ -356,6 +426,213 @@ void apply_camera_props(cv::VideoCapture& cap) {
               << FRAME_WIDTH << "x" << FRAME_HEIGHT << " @ 30 fps)" << std::endl;
 }
 
+// Произнести фразу немедленно, вытеснив всё, что сейчас звучит.
+//
+// Зовут отсюда двое: предупреждение об опасности из главного цикла и сообщение
+// об отказе камеры из потока захвата. Обоим нужен один и тот же тракт, и
+// второй экземпляр этих pkill-шаблонов разъехался бы с первым при первой же
+// правке звука — а промах шаблона здесь не отказ, а тишина, которую никто не
+// заметит.
+void speak_urgent(const std::string& phrase) {
+    // Снимаем всё, что сейчас звучит или синтезируется: скрипт
+    // озвучки, держащий лок flock, сам скрипт, синтез (он остаётся
+    // только на промахах кэша) и воспроизведение.
+    //
+    // Каждый шаблон привязан к НАЧАЛУ командной строки — и это не
+    // косметика. pkill -f сверяет шаблон с командными строками всех
+    // процессов, включая ту оболочку, которую std::system подняла ради
+    // этой самой команды; а в её строке дальше стоит запуск
+    // "/root/diplom-cpp/tools/say.sh", то есть шаблон без якоря
+    // находит сам себя. Оболочка убивала себя первым же pkill, и до
+    // запуска озвучки дело не доходило вообще — предупреждения молчали
+    // полностью. Оболочка всегда начинается с "/bin/sh -c", поэтому
+    // якорь на реальное начало каждой цели её исключает.
+    //
+    // Реальные командные строки целей (сверено на плате):
+    //   flock /run/lock/blind_nav_audio.lock /root/.../say.sh <фраза> core
+    //   /bin/bash /root/diplom-cpp/tools/say.sh <фраза> core
+    //   /root/diplom-cpp/piper/piper/piper --model ... --output-raw
+    //   aplay -D <устройство> -r 22050 ... /root/.../piper/cache/<ключ>.raw
+    //
+    // Шаблон piper сужен до "--output-raw": предварительная сборка
+    // кэша (tools/build_voice_cache.sh) зовёт его с --json-input, и без
+    // этого первое же предупреждение обрывало бы её на середине.
+    // Сигнал готовности микрофона играется не из кэша и тоже уцелеет.
+    // Вытеснение — единственная часть, которой нужна оболочка: это четыре
+    // команды подряд, и никаких данных извне в них нет, только литералы.
+    static const char* KILL_PLAYING =
+        "pkill -f '^flock .*/tools/say[.]sh' >/dev/null 2>&1; "
+        "pkill -f '^/bin/bash /root/diplom-cpp/tools/say[.]sh' >/dev/null 2>&1; "
+        "pkill -f '^/root/diplom-cpp/piper/piper/piper .*--output-raw' >/dev/null 2>&1; "
+        "pkill -f '^aplay .*piper/cache' >/dev/null 2>&1";
+
+    // Результат проверяется не для порядка: -1 означает, что форк не
+    // удался (кончились процессы или память) — предупреждение в этот
+    // момент просто не прозвучит, и знать об этом надо из журнала, а
+    // не гадать потом, почему устройство молчало.
+    if (std::system(KILL_PLAYING) == -1) {
+        std::cerr << "[Звук] Не удалось снять играющую озвучку" << std::endl;
+    }
+
+    // А вот сама фраза уходит отдельным аргументом execvp, а не подставляется
+    // в shell-строку. Раньше здесь было ...say.sh "<фраза>" core &, и держалось
+    // это только на том, что словарь предупреждений закрыт и собирается кодом.
+    // На python-стороне от ровно такой подстановки ушли осознанно (см. speak()
+    // в voice_nav_daemon.py); асимметрия пережила бы того, кто помнит, почему
+    // фразы здесь «заведомо безопасные». Заодно исчезает кавычка как класс
+    // проблемы: любой апостроф в русской формулировке ломал бы команду.
+    //
+    // Двойной fork вместо "&" в конце shell-строки: без него внук остался бы
+    // ребёнком ядра, а ядро за 15 минут прогулки не делает wait ни разу —
+    // накопились бы сотни зомби. После _exit промежуточного процесса внука
+    // усыновляет init, он же его и похоронит.
+    pid_t mid = fork();
+    if (mid < 0) {
+        std::cerr << "[Звук] Не удалось запустить озвучку фразы: "
+                  << phrase << std::endl;
+        return;
+    }
+    if (mid == 0) {
+        if (fork() == 0) {
+            const char* argv[] = {"flock", AUDIO_LOCK_PATH, SAY_SCRIPT,
+                                  phrase.c_str(), "core", nullptr};
+            execvp("flock", const_cast<char* const*>(argv));
+            // execvp вернулся — значит не запустился. _exit, а не exit:
+            // это форк главного цикла, и atexit-обработчики с буферами
+            // потоков здесь трогать нельзя.
+            _exit(127);
+        }
+        _exit(0);
+    }
+    // Ждём только промежуточный процесс — он завершается сразу, озвучка идёт
+    // своим чередом.
+    int status = 0;
+    waitpid(mid, &status, 0);
+}
+
+// Ищет узел /dev/videoN, который действительно отдаёт кадры.
+//
+// Раньше индекс камеры искался один раз на старте по одному признаку
+// «устройство открылось», и восстановление после отказа переиспользовало этот
+// же индекс. Неверно и то и другое. UVC-камера регистрирует несколько узлов (у
+// нашей — video0 и video1), и открывается не только тот из них, что отдаёт
+// видео; а после переподключения по USB номер узла может смениться — тогда
+// переоткрытие вечно долбилось бы в мёртвый индекс, считая, что лечит.
+// Поэтому кандидат проверяется реальным кадром, а не фактом open(), и ищется
+// заново при каждом восстановлении.
+int find_camera_index(int probe_limit = 10) {
+    for (int i = 0; i < probe_limit; i++) {
+        cv::VideoCapture cap(i, cv::CAP_V4L2);
+        if (!cap.isOpened()) cap.open(i);
+        if (!cap.isOpened()) continue;
+
+        apply_camera_props(cap);
+
+        // Первые кадры после открытия камера может не отдать: идёт
+        // согласование формата и раскачка экспозиции.
+        for (int attempt = 0; attempt < 20 && keep_running; attempt++) {
+            cv::Mat probe;
+            cap >> probe;
+            if (!probe.empty()) {
+                cap.release();
+                return i;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        cap.release();
+
+        // Остановку проверяем и здесь: перебор десяти мёртвых узлов занимает
+        // до десяти секунд, а systemd ждёт завершения пятнадцать (см.
+        // TimeoutStopSec) — вместе с ресетом USB в это уже не уложиться.
+        if (!keep_running) break;
+    }
+    return -1;
+}
+
+// USB-порт, за которым сидит /dev/videoN — «5-1» и подобное.
+// /sys/class/video4linux/videoN/device — символическая ссылка на USB-интерфейс
+// (".../usb5/5-1/5-1:1.0"); имя самого устройства — то же без ":интерфейс".
+std::string camera_usb_port(int index) {
+    std::string link = "/sys/class/video4linux/video" + std::to_string(index) + "/device";
+    char buf[512];
+    ssize_t n = ::readlink(link.c_str(), buf, sizeof(buf) - 1);
+    if (n <= 0) return "";
+    buf[n] = '\0';
+
+    std::string target(buf);
+    size_t slash = target.find_last_of('/');
+    std::string leaf = (slash == std::string::npos) ? target : target.substr(slash + 1);
+
+    // Ни двоеточия, ни дефиса — это не USB-интерфейс (например, камера на
+    // MIPI-шине платы). Ресетить там нечего, и гадать не будем.
+    size_t colon = leaf.find(':');
+    if (colon == std::string::npos) return "";
+    std::string port = leaf.substr(0, colon);
+    if (port.find('-') == std::string::npos) return "";
+    return port;
+}
+
+// Логический ресет USB-устройства камеры: отвязать и привязать драйвер.
+//
+// Обычного переоткрытия /dev/videoN мало, когда встал сам модуль камеры:
+// close() не перезагружает его прошивку, и после open() продолжает идти та же
+// чернота. unbind/bind заставляет ядро заново провести устройство через probe
+// — для сенсора это равносильно передёргиванию разъёма, только без рук.
+//
+// Побочный эффект: у той же вебкамеры отвалится и аудио-интерфейс, то есть
+// оборвётся непрерывная запись микрофона. Это предусмотрено —
+// tools/record_session.sh следит за своим ffmpeg и поднимает его заново,
+// дописывая в тот же mp3 (см. mic_alive там же).
+bool usb_port_reset(const std::string& port) {
+    if (port.empty()) return false;
+
+    auto write_to = [&port](const char* path) {
+        std::ofstream f(path);
+        if (!f) return false;
+        f << port;
+        f.flush();
+        return static_cast<bool>(f);
+    };
+
+    std::cerr << "[Camera Thread] Ресет USB-порта " << port << "..." << std::endl;
+    if (!write_to("/sys/bus/usb/drivers/usb/unbind")) {
+        std::cerr << "[Camera Thread] Не удалось отвязать " << port << "." << std::endl;
+        return false;
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+    if (!write_to("/sys/bus/usb/drivers/usb/bind")) {
+        std::cerr << "[Camera Thread] Не удалось привязать " << port
+                  << " обратно — камера осталась отключённой!" << std::endl;
+        return false;
+    }
+    // Перечисление устройства и регистрация узлов /dev/videoN занимают
+    // заметное время: без паузы поиск камеры не найдёт ничего и решит, что
+    // ресет не помог.
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+    return true;
+}
+
+// Кадр без картинки — равномерная заливка любого цвета. См. CAMERA_BLANK_STDDEV.
+//
+// Прореживание именно INTER_NEAREST, а не усреднение: усреднение сгладило бы
+// шум сенсора, по которому живой тёмный кадр как раз и отличается от мёртвого,
+// и ночная съёмка стала бы поводом объявить камеру ослепшей.
+//
+// Считать надо по кадру ДО отрисовки рамок и секундомера: жёлтые цифры на
+// чёрном дают разброс сами по себе, и сторож по такому кадру не сработал бы
+// никогда. Ровно так выглядит запись 19.08 — чёрный экран с бегущим таймером.
+bool frame_is_blank(const cv::Mat& frame) {
+    if (frame.empty()) return true;
+
+    cv::Mat small;
+    cv::resize(frame, small, cv::Size(32, 24), 0, 0, cv::INTER_NEAREST);
+    if (small.channels() > 1) cv::cvtColor(small, small, cv::COLOR_BGR2GRAY);
+
+    cv::Scalar mean, stddev;
+    cv::meanStdDev(small, mean, stddev);
+    return stddev[0] < CAMERA_BLANK_STDDEV;
+}
+
 void camera_thread_func(int camera_index) {
     cv::VideoCapture cap(camera_index, cv::CAP_V4L2);
     if (!cap.isOpened()) cap.open(camera_index);
@@ -371,11 +648,84 @@ void camera_thread_func(int camera_index) {
     auto last_good_frame = std::chrono::steady_clock::now();
     const float CAMERA_TIMEOUT_SEC = 3.0f;
 
+    // Состояние сторожа «кадры идут, а картинки в них нет».
+    bool blank_run = false;                                  // серия пустых кадров идёт
+    std::chrono::steady_clock::time_point blank_since{};     // с какого момента
+    bool camera_blind = false;                               // отказ объявлен
+    std::chrono::steady_clock::time_point blind_announced{}; // когда сказали вслух
+    std::chrono::steady_clock::time_point next_recovery{};   // когда лечить
+    int reopen_tries = 0;
+
+    // Переоткрытие с повторным поиском узла: после переподключения по USB
+    // камера может вернуться под другим номером (см. find_camera_index).
+    auto reopen_camera = [&]() {
+        cap.release();
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+        int found = find_camera_index();
+        if (found >= 0) {
+            camera_index = found;
+            cap.open(camera_index, cv::CAP_V4L2);
+            if (!cap.isOpened()) cap.open(camera_index);
+        }
+
+        if (cap.isOpened()) {
+            apply_camera_props(cap);
+            std::cerr << "[Camera Thread] Камера переоткрыта: /dev/video" << camera_index
+                      << std::endl;
+        } else {
+            std::cerr << "[Camera Thread] Переоткрыть камеру не удалось, повторю позже."
+                      << std::endl;
+        }
+
+        // Серия пустых кадров шла до переоткрытия — засчитывать её заново
+        // открытой камере нельзя, иначе отказ объявится повторно мгновенно.
+        blank_run = false;
+        last_good_frame = std::chrono::steady_clock::now();
+    };
+
     while (keep_running) {
         cv::Mat temp_frame;
         cap >> temp_frame;
+        auto now = std::chrono::steady_clock::now();
+
         if (!temp_frame.empty()) {
-            last_good_frame = std::chrono::steady_clock::now();
+            last_good_frame = now;
+
+            // 0. Сторож содержимого кадра — обязательно ДО отрисовки: рамки и
+            // секундомер сами по себе дают разброс яркости, и по кадру с ними
+            // сторож не сработал бы никогда.
+            if (frame_is_blank(temp_frame)) {
+                if (!blank_run) {
+                    blank_run = true;
+                    blank_since = now;
+                }
+            } else {
+                blank_run = false;
+                if (camera_blind) {
+                    std::cerr << "[Camera Thread] Картинка вернулась." << std::endl;
+                    speak_urgent(PHRASE_CAMERA_BACK);
+                    camera_blind = false;
+                    reopen_tries = 0;
+                }
+            }
+
+            if (!camera_blind && blank_run &&
+                std::chrono::duration<float>(now - blank_since).count() > CAMERA_BLANK_TIMEOUT_SEC) {
+                std::cerr << "[Camera Thread] Кадры идут, но картинки в них нет — камера ослепла."
+                          << std::endl;
+                camera_blind = true;
+                blind_announced = now;
+                next_recovery = now;   // лечить немедленно
+                reopen_tries = 0;
+                speak_urgent(PHRASE_CAMERA_BLIND);
+            }
+
+            if (camera_blind &&
+                std::chrono::duration<float>(now - blind_announced).count() > CAMERA_BLIND_REANNOUNCE_SEC) {
+                blind_announced = now;
+                speak_urgent(PHRASE_CAMERA_BLIND);
+            }
 
             // 1. Отдаем чистый кадр нейросети
             {
@@ -409,23 +759,42 @@ void camera_thread_func(int camera_index) {
             // 3. Пишем готовый плавный кадр в файл (нарезка по отрезкам — см. SessionRecorder)
             video_out.write(temp_frame);
         } else {
-            std::chrono::duration<float> since_good = std::chrono::steady_clock::now() - last_good_frame;
+            std::chrono::duration<float> since_good = now - last_good_frame;
             if (since_good.count() > CAMERA_TIMEOUT_SEC) {
                 std::cerr << "\n[Camera Thread] Камера не отвечает " << since_good.count()
                           << " с — переоткрываю устройство..." << std::endl;
-                cap.release();
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                cap.open(camera_index, cv::CAP_V4L2);
-                if (!cap.isOpened()) cap.open(camera_index);
-                if (cap.isOpened()) {
-                    apply_camera_props(cap);
-                    std::cerr << "[Camera Thread] Камера переоткрыта." << std::endl;
-                } else {
-                    std::cerr << "[Camera Thread] Переоткрыть камеру не удалось, повторю позже." << std::endl;
-                }
-                last_good_frame = std::chrono::steady_clock::now();
+                reopen_camera();
             }
         }
+
+        // Лечение ослепшей камеры. Здесь, а не в ветке кадра: при этом отказе
+        // кадры как раз идут, просто пустые, и ветка «камера не отвечает» на
+        // него не выйдет никогда.
+        if (camera_blind && now >= next_recovery) {
+            // Порт узнаём до отвязки: после неё узла /dev/videoN уже нет.
+            std::string port = camera_usb_port(camera_index);
+
+            // Сначала просто переоткрываем — этого хватает, если встал
+            // драйвер, а не сам модуль. Если два раза подряд не помогло,
+            // дёргаем устройство через unbind/bind: прошивку сенсора
+            // перезагружает только это.
+            if (reopen_tries >= CAMERA_REOPEN_TRIES_BEFORE_USB_RESET && !port.empty()) {
+                cap.release();
+                usb_port_reset(port);
+                reopen_tries = 0;
+            }
+            reopen_tries++;
+
+            reopen_camera();
+
+            // Отсчёт до следующей попытки — от её конца, а не от начала:
+            // ресет USB вместе с перечислением устройства съедает шесть
+            // секунд, и от начала пауза между попытками вышла бы вдвое
+            // короче задуманной.
+            next_recovery = std::chrono::steady_clock::now() + std::chrono::seconds(
+                static_cast<long long>(CAMERA_RECOVERY_INTERVAL_SEC));
+        }
+
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
@@ -538,16 +907,10 @@ int main(int argc, char** argv) {
     std::thread btn_thread(listen_button);
     std::thread mic_status_thread(mic_status_watcher);
 
-    int working_camera = -1;
-    for (int i = 0; i < 10; i++) {
-        cv::VideoCapture temp_cap(i, cv::CAP_V4L2);
-        if (!temp_cap.isOpened()) temp_cap.open(i);
-        if (temp_cap.isOpened()) {
-            working_camera = i;
-            temp_cap.release();
-            break;
-        }
-    }
+    // Поиск узла, который реально отдаёт кадры (см. find_camera_index).
+    // Прежний перебор считал камерой первое устройство, которое просто
+    // открылось, — а у UVC-камеры открывается и служебный узел без видео.
+    int working_camera = find_camera_index();
 
     if (working_camera == -1) {
         std::cerr << "Ошибка: Камера не найдена!" << std::endl;
@@ -591,7 +954,15 @@ int main(int argc, char** argv) {
         // это просто перестановка каналов R/B, и повторная перестановка отменяет
         // первую), и на NPU в итоге уходил BGR вместо ожидаемого RGB — тихая
         // порча входа модели на каждом кадре без единой ошибки в логах.
+        // Инференс замеряется отдельно от витка. Раньше в строке состояния
+        // печаталось «Инференс: <total_ms>», где total_ms охватывал весь виток
+        // целиком — инференс, decode, пайплайн, запуск озвучки и кодирование
+        // кадра для веб-стрима. По этой строке в METRICS.md попала цифра
+        // «инференс 41 мс», то есть NPU записали в отчёт медленнее, чем он есть.
+        auto infer_start = std::chrono::high_resolution_clock::now();
         auto raw_out = model.infer(frame);
+        std::chrono::duration<float, std::milli> infer_ms =
+            std::chrono::high_resolution_clock::now() - infer_start;
         if (raw_out.size() != 3) {
             // Инференс не удался в этом кадре (сбой NPU/несовпадение размеров выходов) —
             // пропускаем кадр вместо чтения неинициализированной/чужой памяти.
@@ -640,55 +1011,17 @@ int main(int argc, char** argv) {
         // полностью подавлялись на время GPS-навигации. По техзаданию это
         // неверно: предупреждение об опасности должно звучать всегда.
         if (decision.speak) {
-            // Снимаем всё, что сейчас звучит или синтезируется: скрипт
-            // озвучки, держащий лок flock, сам скрипт, синтез (он остаётся
-            // только на промахах кэша) и воспроизведение.
-            //
-            // Каждый шаблон привязан к НАЧАЛУ командной строки — и это не
-            // косметика. pkill -f сверяет шаблон с командными строками всех
-            // процессов, включая ту оболочку, которую std::system подняла ради
-            // этой самой команды; а в её строке дальше стоит запуск
-            // "/root/diplom-cpp/tools/say.sh", то есть шаблон без якоря
-            // находит сам себя. Оболочка убивала себя первым же pkill, и до
-            // запуска озвучки дело не доходило вообще — предупреждения молчали
-            // полностью. Оболочка всегда начинается с "/bin/sh -c", поэтому
-            // якорь на реальное начало каждой цели её исключает.
-            //
-            // Реальные командные строки целей (сверено на плате):
-            //   flock /run/lock/blind_nav_audio.lock /root/.../say.sh <фраза> core
-            //   /bin/bash /root/diplom-cpp/tools/say.sh <фраза> core
-            //   /root/diplom-cpp/piper/piper/piper --model ... --output-raw
-            //   aplay -D <устройство> -r 22050 ... /root/.../piper/cache/<ключ>.raw
-            //
-            // Шаблон piper сужен до "--output-raw": предварительная сборка
-            // кэша (tools/build_voice_cache.sh) зовёт его с --json-input, и без
-            // этого первое же предупреждение обрывало бы её на середине.
-            // Сигнал готовности микрофона играется не из кэша и тоже уцелеет.
-            std::string command =
-                std::string("pkill -f '^flock .*/tools/say[.]sh' >/dev/null 2>&1; ")
-                + "pkill -f '^/bin/bash /root/diplom-cpp/tools/say[.]sh' >/dev/null 2>&1; "
-                + "pkill -f '^/root/diplom-cpp/piper/piper/piper .*--output-raw' >/dev/null 2>&1; "
-                + "pkill -f '^aplay .*piper/cache' >/dev/null 2>&1; "
-                + "flock " + AUDIO_LOCK_PATH + " " + SAY_SCRIPT
-                + " \"" + decision.phrase + "\" core &";
-
-            // Результат проверяется не для порядка: -1 означает, что форк не
-            // удался (кончились процессы или память) — предупреждение в этот
-            // момент просто не прозвучит, и знать об этом надо из журнала, а
-            // не гадать потом, почему устройство молчало.
-            if (std::system(command.c_str()) == -1) {
-                std::cerr << "[Звук] Не удалось запустить озвучку фразы: "
-                          << decision.phrase << std::endl;
-            }
+            speak_urgent(decision.phrase);
         }
 
-        // Сохраняем чистый кадр (без графики) для веб-стриминга (если нужно)
-        std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 70};
-        cv::imwrite("/dev/shm/stream_tmp.jpg", frame, params);
-        std::rename("/dev/shm/stream_tmp.jpg", "/dev/shm/stream.jpg");
-
+        // Здесь на каждом кадре кодировался JPEG 640x480 в /dev/shm/stream.jpg
+        // «для веб-стриминга (если нужно)». Читать его было некому:
+        // python/web_stream.py не поднимался ни systemd-юнитом, ни install.sh и
+        // не упоминался в документации, а выключателя у записи не было. Платил
+        // за неё главный цикл — тот самый, чья задержка означает предупреждение,
+        // прозвучавшее позже, чем нужно.
         auto end_time = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<float, std::milli> total_ms = end_time - start_time;
+        std::chrono::duration<float, std::milli> loop_ms = end_time - start_time;
 
         // Строка состояния. В терминале она перерисовывается на месте через \r,
         // но под systemd терминала нет: journald считает возврат каретки
@@ -704,7 +1037,8 @@ int main(int argc, char** argv) {
             status << "[Кадр " << frame_count << "] Треков: " << pipeline.track_count()
                    << " | Темп: " << get_temperature() << " C"
                    << " | Цель: " << priority_info
-                   << " | Инференс: " << total_ms.count() << " ms";
+                   << " | Инференс: " << infer_ms.count() << " ms"
+                   << " | Виток: " << loop_ms.count() << " ms";
             if (stdout_is_tty) {
                 std::cout << "\r" << status.str() << "      " << std::flush;
             } else {

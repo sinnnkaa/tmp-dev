@@ -89,7 +89,7 @@ void decode_single_output(const float* output, int grid_size, int stride,
 std::vector<Detection> decode(const std::vector<std::vector<float>>& outputs, 
                               int input_w, int input_h,
                               int orig_w, int orig_h, float threshold,
-                              int* clipped_out) {
+                              int* dropped_out) {
     std::vector<Detection> all_dets;
     
     int strides[] = {8, 16, 32};
@@ -111,8 +111,8 @@ std::vector<Detection> decode(const std::vector<std::vector<float>>& outputs,
 
         if (real_x >= 0 && real_y >= 0 && (real_x + real_w) <= orig_w && (real_y + real_h) <= orig_h) {
             final_dets.push_back({det.class_id, det.score, real_x, real_y, real_w, real_h});
-        } else if (clipped_out) {
-            (*clipped_out)++;
+        } else if (dropped_out) {
+            (*dropped_out)++;
         }
     }
 

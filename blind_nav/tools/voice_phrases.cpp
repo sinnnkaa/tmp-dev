@@ -16,6 +16,7 @@
 
 #include "threat_logic.h"
 #include "pipeline.h"
+#include "device_phrases.h"
 
 int main() {
     // Ровно то, что собирает NavPipeline::process():
@@ -36,6 +37,14 @@ int main() {
                           << meters << " " << get_plural_meters(meters) << "\n";
             }
         }
+    }
+
+    // Сообщения о состоянии самого устройства. Синтезировать их заранее важнее,
+    // чем предупреждения: они звучат ровно тогда, когда что-то отказало, и
+    // пятисекундная пауза на загрузку модели piper пришлась бы именно на тот
+    // момент, когда человек ещё не знает, что прибор перестал видеть.
+    for (const std::string& phrase : device_phrases()) {
+        std::cout << phrase << "\n";
     }
 
     return 0;

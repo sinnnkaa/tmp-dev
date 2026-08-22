@@ -29,14 +29,20 @@ DAEMON_SRC="$BLINDNAV_ROOT/python/voice_nav_daemon.py"
 
 mkdir -p "$VOICE_CACHE_DIR"
 
-if [ ! -x "$PHRASES_BIN" ]; then
-    echo "==> Собираю voice_phrases"
-    ( cd "$BLINDNAV_ROOT/blind_nav/build" \
-      && cmake -DBUILD_VOICE_PHRASES=ON .. >/dev/null \
-      && make voice_phrases >/dev/null ) || {
+# Пересобираем всегда, а не только когда бинарника нет. Список фраз живёт в
+# коде, и устаревший бинарник молча синтезировал бы вчерашний набор — то есть
+# ровно тот промах кэша, ради которого список и генерируется из боевого кода, а
+# не выписывается здесь. Так и случилось бы с фразами об отказе камеры: они
+# добавлены в voice_phrases, но рядом уже лежал собранный до этого бинарник.
+echo "==> Собираю voice_phrases"
+if ! ( cd "$BLINDNAV_ROOT/blind_nav/build" \
+       && cmake -DBUILD_VOICE_PHRASES=ON .. >/dev/null \
+       && make voice_phrases >/dev/null ); then
+    if [ ! -x "$PHRASES_BIN" ]; then
         echo "Не удалось собрать voice_phrases" >&2
         exit 1
-    }
+    fi
+    echo "Собрать voice_phrases не удалось — беру прежний бинарник, кэш может отстать" >&2
 fi
 
 TMP=$(mktemp -d /dev/shm/voice_cache_XXXXXX)
