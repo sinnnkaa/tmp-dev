@@ -491,6 +491,35 @@ class BtDeviceNameTests(unittest.TestCase):
             self.assertIsNone(vnd.bt_device_name("sink"))
 
 
+class ReadyToneTests(unittest.TestCase):
+    """Сигнал «можно говорить» обязан звучать и обязан звучать до записи.
+
+    Он единственное, чем устройство сообщает незрячему человеку, что микрофон
+    открыт. Если он не прозвучит, человек промолчит в открытый микрофон и
+    получит «адрес не распознан», не поняв, почему.
+    """
+
+    @mock.patch("voice_nav_daemon.bt_device_name", return_value="bluez_sink.XX.handsfree_head_unit")
+    @mock.patch("voice_nav_daemon.playback_device", return_value="pulse:bluez_sink.XX.handsfree_head_unit")
+    @mock.patch("voice_nav_daemon.subprocess.run")
+    def test_warmup_precedes_the_tone(self, mock_run, _dev, _name):
+        vnd.play_ready_tone()
+        cmd = next(c.args[0] for c in mock_run.call_args_list if c.args[0][0] == "flock")
+        inner = cmd[-1]
+        # Тишина нужной длины идёт первым входом, тон — после неё.
+        self.assertIn(f"anullsrc=r=16000:cl=mono:d={vnd.READY_TONE_WARMUP}", inner)
+        self.assertLess(inner.index("anullsrc"), inner.index("sine=frequency=740"))
+
+    def test_warmup_is_not_zero(self):
+        """Ноль здесь означал бы сигнал, проваливающийся в разгон линка.
+
+        Значение уменьшено с 1.0 до 0.35 вместе с переходом на постоянный HFP;
+        обнулять его нельзя — 0.35 это то, что подтвердил живой тест для
+        тёплого линка, а не запас «на всякий случай».
+        """
+        self.assertGreaterEqual(vnd.READY_TONE_WARMUP, 0.3)
+
+
 class ProfileConstantTests(unittest.TestCase):
     """Профиль записан в двух файлах на разных языках и обязан совпадать.
 
