@@ -32,20 +32,28 @@ set -u
 # просто самый большой файл через `ls -S` и вытащила killtest_long.raw —
 # сорокапятисекундный огрызок от старых проверок вытеснения фразы. Слушать
 # качество речи по нему нельзя, а выглядело это как "звука нет".
+# Отсортированы по убыванию размера: на длинной фразе дефекты слышно лучше.
+# Через ls+grep, а не через `find -regex`: интервал \{40\} у find зависит от
+# диалекта регулярных выражений и на busybox-сборках не понимается вовсе, а
+# стоявший рядом 2>/dev/null проглатывал жалобу — отбор возвращал пусто, и
+# скрипт объявлял пустым кэш.
 cache_utterances() {
-    find "$VOICE_CACHE_DIR" -maxdepth 1 -type f \
-         -regex '.*/[0-9a-f]\{40\}\.raw' -size +1k 2>/dev/null
+    ls -S "$VOICE_CACHE_DIR"/*.raw 2>/dev/null | grep -E '/[0-9a-f]{40}\.raw$'
 }
 
 SRC="${1:-}"
-if [ -z "$SRC" ]; then
-    # Самая длинная НАСТОЯЩАЯ реплика: на длинной фразе дефекты слышно лучше,
-    # чем на "Осторожно".
-    SRC=$(cache_utterances | xargs -r ls -S 2>/dev/null | head -1)
-fi
+[ -n "$SRC" ] || SRC=$(cache_utterances | head -1)
+
 if [ ! -s "${SRC:-}" ]; then
-    echo "Нечего играть: в $VOICE_CACHE_DIR нет готовых реплик." >&2
-    echo "Сначала tools/build_voice_cache.sh" >&2
+    # Отказ обязан отличать "кэш пуст" от "мой отбор ничего не выбрал". Первая
+    # версия говорила только первое, а случилось второе — и разбор встал.
+    echo "Не нашёл ни одной готовой реплики в $VOICE_CACHE_DIR." >&2
+    echo "Ожидались имена из сорока шестнадцатеричных знаков: ключ кэша — sha1" >&2
+    echo "от текста фразы. Что лежит на самом деле (всего файлов:" \
+         "$(ls -1 "$VOICE_CACHE_DIR" 2>/dev/null | wc -l)):" >&2
+    ls -S "$VOICE_CACHE_DIR" 2>/dev/null | head -10 | sed 's/^/    /' >&2
+    echo "Если подходящих имён там правда нет — соберите кэш:" >&2
+    echo "    tools/build_voice_cache.sh" >&2
     exit 1
 fi
 
@@ -197,7 +205,7 @@ fi
 # режиме рвётся — дело в старте каждого потока, а не в тракте.
 if announce "Прогон 3 из 4. ДЛИННЫЙ ПОТОК: десять реплик одним запуском."; then
     : > "$TMP/long.raw"
-    cache_utterances | xargs -r ls -S 2>/dev/null | head -10 | while read -r f; do
+    cache_utterances | head -10 | while read -r f; do
         cat "$f" >> "$TMP/long.raw"
     done
     run_and_report aplay -D "$DEV" -r "$PIPER_RATE" -f S16_LE -t raw -c 1 "$TMP/long.raw"
