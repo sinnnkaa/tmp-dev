@@ -453,6 +453,66 @@ class CaptureDeviceTests(unittest.TestCase):
         mock_flag.assert_not_called()
 
 
+class CaptureCleanupTests(unittest.TestCase):
+    """После диктовки процесс захвата обязан умереть.
+
+    На плате это проверялось так: `systemctl status nav_daemon` спустя минуту
+    после распознанного адреса всё ещё показывал в дереве процессов
+    `ffmpeg ... -i bluez_source... -t 7`. Живой, не зомби (зомби в cgroup не
+    попадают) — то есть микрофон гарнитуры оставался открытым.
+
+    Пока профиль после диктовки возвращался в a2dp_sink, эта ошибка была
+    невидимой: bluez_source исчезал вместе с источником, и зависший захват
+    умирал сам. В постоянном HFP исчезать нечему.
+    """
+
+    def _run_listen(self, proc):
+        rec = mock.MagicMock()
+        rec.AcceptWaveform.return_value = True
+        rec.Result.return_value = '{"text": "ленина двадцать пять"}'
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(vnd, "MIC_LOG_PATH", os.path.join(tmp, "mic.raw")), \
+                 mock.patch.object(vnd, "capture_device", return_value="bluez_source.XX.handsfree_head_unit"), \
+                 mock.patch.object(vnd, "session_speech_dir", return_value=None), \
+                 mock.patch.object(vnd, "write_mic_open"), \
+                 mock.patch.object(vnd, "KaldiRecognizer", return_value=rec), \
+                 mock.patch.object(vnd.subprocess, "Popen", return_value=proc):
+                return vnd.listen_and_transcribe(mock.MagicMock(), 7)
+
+    @staticmethod
+    def _proc():
+        proc = mock.MagicMock()
+        # Один блок данных, которого хватает Vosk на финальный результат: цикл
+        # выйдет по break, не дочитав поток до конца. Это и есть тот самый
+        # случай ранней остановки, в котором ffmpeg оставался жить.
+        proc.stdout.read.return_value = b"\x00" * 4000
+        return proc
+
+    def test_pipe_closed_and_process_reaped(self):
+        proc = self._proc()
+        self.assertEqual(self._run_listen(proc), "ленина двадцать пять")
+        # Труба закрывается обязательно: пока её читающий конец открыт, а
+        # никто не читает, ffmpeg стоит в write() и terminate() до него не
+        # доходит.
+        proc.stdout.close.assert_called_once()
+        proc.terminate.assert_called_once()
+        proc.wait.assert_called_once()
+        self.assertEqual(proc.wait.call_args.kwargs["timeout"], vnd.CAPTURE_EXIT_TIMEOUT)
+        proc.kill.assert_not_called()
+
+    def test_stuck_process_is_killed(self):
+        proc = self._proc()
+        proc.wait.side_effect = [
+            vnd.subprocess.TimeoutExpired(cmd="ffmpeg", timeout=vnd.CAPTURE_EXIT_TIMEOUT),
+            0,
+        ]
+        self.assertEqual(self._run_listen(proc), "ленина двадцать пять")
+        # Не ушёл за отведённое время — добиваем. Оставить его нельзя: это
+        # открытый микрофон гарнитуры на всю оставшуюся прогулку.
+        proc.kill.assert_called_once()
+        self.assertEqual(proc.wait.call_count, 2)
+
+
 class BtDeviceNameTests(unittest.TestCase):
     """Устройство выбирается по рабочему профилю, а не «первое bluez».
 
