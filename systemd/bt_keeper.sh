@@ -126,6 +126,63 @@ tune_audio_server() {
     fi
 }
 
+# Удержание рабочего профиля. Профиль ставится здесь, а не в демоне: демон
+# запускается позже, может быть остановлен, а озвучка предупреждений об
+# опасности идёт из C++ ядра вообще мимо него. Профиль обязан быть верным с
+# первой секунды после подключения наушников.
+#
+# Почему именно HFP — см. BLINDNAV_BT_PROFILE в tools/voice_env.sh: A2DP на
+# этой плате не влезает в UART-канал контроллера и играет на дне шкалы SBC.
+#
+# Отдельная проверка на частоту не придирка. У HFP два кодека: mSBC даёт
+# 16 кГц, а старый CVSD — 8 кГц, и различить их на слух легко только зная,
+# что искать: CVSD звучит как телефон из девяностых. Гарнитуру уже пробовали
+# в HFP несколько месяцев назад, и тогда звук был плохим — очень похоже, что
+# согласовался как раз CVSD. Молча получить 8 кГц и решить, что HFP «тоже не
+# помог», — самый вероятный способ потерять найденное решение.
+enforce_audio_profile() {
+    local card current sink rate
+    card=$(pactl list cards short 2>/dev/null \
+           | awk -v m="$BLINDNAV_BT_MAC_UND" '$2 ~ m {print $2; exit}')
+    [ -n "$card" ] || return 0
+
+    current=$(pactl list cards 2>/dev/null \
+              | awk -v c="$card" '
+                    index($0, "Name: " c) { f = 1 }
+                    f && /Active Profile:/ { print $3; exit }')
+    if [ "$current" != "$BLINDNAV_BT_PROFILE" ]; then
+        if pactl set-card-profile "$card" "$BLINDNAV_BT_PROFILE" 2>/dev/null; then
+            echo "[BT Keeper] Профиль: $current -> $BLINDNAV_BT_PROFILE"
+        else
+            echo "[BT Keeper] ВНИМАНИЕ: профиль $BLINDNAV_BT_PROFILE не ставится" \
+                 "(сейчас $current). Звук пойдёт в том, что есть." >&2
+            return 1
+        fi
+    fi
+
+    [ "$BLINDNAV_BT_PROFILE" = "handsfree_head_unit" ] || return 0
+    sink=$(pactl list sinks short 2>/dev/null \
+           | awk -F'\t' '$2 ~ /handsfree/ {print $4; exit}')
+    rate=${sink%%Hz*}; rate=${rate##* }
+    case "$rate" in
+        16000) [ "$state_codec" = "msbc" ] || {
+                   echo "[BT Keeper] HFP согласован как mSBC, 16 кГц — это рабочий режим."
+                   state_codec=msbc
+               } ;;
+        8000)  [ "$state_codec" = "cvsd" ] || {
+                   echo "[BT Keeper] ВНИМАНИЕ: HFP согласован как CVSD, 8 кГц вместо" \
+                        "mSBC. Речь будет глухой и шипящей. Проверьте, что в" \
+                        "/etc/bluetooth/main.conf не выключен wideband speech." >&2
+                   state_codec=cvsd
+               } ;;
+        "")    : ;;   # синка ещё нет — профиль поднимается, скажем на следующем витке
+        *)     [ "$state_codec" = "$rate" ] || {
+                   echo "[BT Keeper] HFP на неожиданной частоте ${rate} Гц."
+                   state_codec=$rate
+               } ;;
+    esac
+}
+
 start_audio_server() {
     echo "[BT Keeper] Аудиосервер не отвечает — запускаю..."
     killall pulseaudio 2>/dev/null
@@ -185,6 +242,10 @@ start_audio_server() {
 retry_delay=$RETRY_MIN_SEC
 next_attempt=0
 state=""
+# Последний доложенный кодек HFP. Нужен затем же, зачем $state: без него
+# строка про mSBC печаталась бы каждые десять секунд и журнал стал бы
+# нечитаемым — а именно в нём ищут причину, когда звук снова испортится.
+state_codec=""
 
 # Сервер поднимается отсюда же и остаётся в cgroup этого юнита (проверено на
 # плате: systemctl status bt_keeper показывает pulseaudio в своём дереве).
@@ -234,6 +295,12 @@ while true; do
     audio_alive && tune_audio_server
 
     if connected; then
+        # Профиль проверяется на каждом витке, а не один раз после
+        # подключения: его может увести кто угодно — module-bluetooth-policy,
+        # ручная команда, переподключение гарнитуры после разрыва. Функция
+        # молчит, пока всё на месте, и пишет только при изменении.
+        enforce_audio_profile
+
         # Пишем только смену состояния: иначе журнал забивается строками
         # об одном и том же, и в нём не видно ничего другого.
         if [ "$state" != "up" ]; then

@@ -10,6 +10,8 @@
     python3 -m unittest discover -s python/tests -v
 """
 import os
+import pathlib
+import re
 import sys
 import tempfile
 import types
@@ -379,15 +381,22 @@ class MicProfileReadyTests(SilentAudioTestCase):
     @mock.patch("voice_nav_daemon.switch_bt_profile", return_value=True)
     def test_true_when_profile_confirmed(self, mock_switch, _speak):
         self.assertTrue(vnd.mic_profile_ready())
-        mock_switch.assert_called_once_with("handsfree_head_unit")
+        mock_switch.assert_called_once_with(vnd.BT_PROFILE)
 
     @mock.patch("voice_nav_daemon.speak")
     @mock.patch("voice_nav_daemon.switch_bt_profile", return_value=False)
-    def test_returns_to_a2dp_and_reports_failure(self, mock_switch, mock_speak):
+    def test_reports_failure_without_falling_back_to_a2dp(self, mock_switch, mock_speak):
+        """При неудаче профиль НЕ переставляется в A2DP.
+
+        Раньше переставлялся, и это было верно: рабочим профилем был A2DP.
+        Теперь рабочий профиль — HFP (см. BT_PROFILE: A2DP не влезает в
+        UART-канал контроллера и играет на дне шкалы SBC), и уход в A2DP
+        менял бы одну поломку на другую, гарантированно плохо звучащую.
+        """
         self.assertFalse(vnd.mic_profile_ready())
         self.assertEqual(
             [c.args[0] for c in mock_switch.call_args_list],
-            ["handsfree_head_unit", "a2dp_sink"],
+            [vnd.BT_PROFILE],
         )
         mock_speak.assert_called_once_with("Микрофон гарнитуры не готов", sync=True)
 
@@ -442,6 +451,63 @@ class CaptureDeviceTests(unittest.TestCase):
         # Флаг "микрофон открыт" не должен даже подниматься: пока он поднят,
         # C++ ядро откладывает предупреждения об опасности, то есть молчит.
         mock_flag.assert_not_called()
+
+
+class BtDeviceNameTests(unittest.TestCase):
+    """Устройство выбирается по рабочему профилю, а не «первое bluez».
+
+    При смене профиля старый синк исчезает не мгновенно, и какое-то время в
+    списке лежат оба. Выбор первого попавшегося тогда указывает на профиль,
+    который карта покидает, — и звук уходит мимо гарнитуры молча, без единой
+    ошибки в журнале. Это и был живой симптом «a2dp иногда звучит как hfp».
+    """
+
+    A2DP = "bluez_sink.1C_6E_4C_89_E9_32.a2dp_sink"
+    HFP = "bluez_sink.1C_6E_4C_89_E9_32.handsfree_head_unit"
+
+    def _pactl(self, names):
+        out = "".join(
+            f"{i}\t{n}\tmodule-bluez5-device.c\ts16le 1ch 16000Hz\tIDLE\n"
+            for i, n in enumerate(names)
+        )
+        return mock.patch(
+            "voice_nav_daemon.subprocess.run",
+            return_value=mock.MagicMock(stdout=out),
+        )
+
+    def test_prefers_working_profile_when_both_listed(self):
+        # Порядок намеренно «неудобный»: A2DP идёт первым, и наивный выбор
+        # первого элемента вернул бы именно его.
+        with self._pactl([self.A2DP, self.HFP]):
+            self.assertEqual(vnd.bt_device_name("sink"), self.HFP)
+
+    def test_falls_back_to_any_bluez_device(self):
+        # Речь в неверном профиле звучит глухо, но звучит. Молчание хуже.
+        with self._pactl([self.A2DP]):
+            self.assertEqual(vnd.bt_device_name("sink"), self.A2DP)
+
+    def test_none_without_headset(self):
+        with self._pactl(["alsa_output.platform-rk809-sound.stereo-fallback"]):
+            self.assertIsNone(vnd.bt_device_name("sink"))
+
+
+class ProfileConstantTests(unittest.TestCase):
+    """Профиль записан в двух файлах на разных языках и обязан совпадать.
+
+    Расхождение здесь не даёт отказа: shell будет играть в один синк, python
+    искать другой, и половина звука пойдёт мимо гарнитуры — ровно тот тихий
+    промах, который в этом проекте ловили дольше всего.
+    """
+
+    def test_matches_voice_env(self):
+        env = (pathlib.Path(__file__).resolve().parents[2]
+               / "tools" / "voice_env.sh").read_text(encoding="utf-8")
+        # Класс с цифрами: без них "a2dp_sink" не распознаётся, и при
+        # расхождении тест падал бы с "не найден" вместо "не совпадает" —
+        # отправляя искать пропавшую строку вместо неверного значения.
+        match = re.search(r'BLINDNAV_BT_PROFILE="\$\{BLINDNAV_BT_PROFILE:-([a-z0-9_]+)\}"', env)
+        self.assertIsNotNone(match, "BLINDNAV_BT_PROFILE не найден в voice_env.sh")
+        self.assertEqual(match.group(1), vnd.BT_PROFILE)
 
 
 class SharedConstantsTests(unittest.TestCase):
