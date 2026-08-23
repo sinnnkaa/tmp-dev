@@ -27,11 +27,21 @@ set -u
 
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/voice_env.sh"
 
+# Только настоящие реплики. Ключ кэша — sha1 от текста, поэтому боевые файлы
+# называются сорока шестнадцатеричными знаками. Первая версия скрипта брала
+# просто самый большой файл через `ls -S` и вытащила killtest_long.raw —
+# сорокапятисекундный огрызок от старых проверок вытеснения фразы. Слушать
+# качество речи по нему нельзя, а выглядело это как "звука нет".
+cache_utterances() {
+    find "$VOICE_CACHE_DIR" -maxdepth 1 -type f \
+         -regex '.*/[0-9a-f]\{40\}\.raw' -size +1k 2>/dev/null
+}
+
 SRC="${1:-}"
 if [ -z "$SRC" ]; then
-    # Самый длинный файл кэша: на длинной фразе дефекты слышно лучше, чем на
-    # "Осторожно".
-    SRC=$(ls -S "$VOICE_CACHE_DIR"/*.raw 2>/dev/null | head -1)
+    # Самая длинная НАСТОЯЩАЯ реплика: на длинной фразе дефекты слышно лучше,
+    # чем на "Осторожно".
+    SRC=$(cache_utterances | xargs -r ls -S 2>/dev/null | head -1)
 fi
 if [ ! -s "${SRC:-}" ]; then
     echo "Нечего играть: в $VOICE_CACHE_DIR нет готовых реплик." >&2
@@ -75,6 +85,23 @@ else
     echo "   методом trivial. Это и есть скрип. Прогон 2 должен звучать заметно чище."
 fi
 grep -E "^\s*resample-method" /etc/pulse/daemon.conf 2>/dev/null | sed 's/^/   daemon.conf: /'
+echo
+echo "-- чем занята плата --"
+# Кто сейчас работает: хруст, который есть под нагрузкой и пропадает на
+# простое, — это не свойство звукового тракта, а следствие соседей.
+for unit in blind_nav_main nav_record nav_daemon osrm; do
+    printf '   %-16s %s\n' "$unit" "$(systemctl is-active "$unit" 2>/dev/null)"
+done
+printf '   %-16s %s\n' "load average" "$(cut -d' ' -f1-3 /proc/loadavg)"
+echo
+echo "-- шина bluetooth --"
+# Ключевой вопрос: сидит ли контроллер Bluetooth на USB рядом с камерой.
+# Камера отдаёт MJPG 640x480@30, и если оба висят на одном контроллере USB,
+# поток видео забивает шину, а в наушниках это прерывания. Ни приоритеты, ни
+# формат звука, ни SBC к такому отношения не имеют, и крутить их бесполезно.
+hciconfig -a 2>/dev/null | grep -E "^hci|Bus:|Type:" | sed 's/^/   /'
+echo "   -- дерево USB (ищите камеру и bluetooth на одном хабе) --"
+lsusb -t 2>/dev/null | sed 's/^/   /'
 echo
 echo "-- модули --"
 pactl list short modules 2>/dev/null \
@@ -126,7 +153,30 @@ fi
 
 # --- 1. Боевой путь -------------------------------------------------------
 if announce "Прогон 1 из 4. ТОТ ЖЕ ПУТЬ БЕЗ ОБВЯЗКИ: 22050 моно, пересчёт в сервере."; then
+    # Пока играет, раз в полсекунды снимаем фактическую задержку синка.
+    # Отставание от configured — это и есть недобор буфера, то самое, что в
+    # наушниках слышно как прерывание. Так "то хорошо, то с помехами"
+    # превращается в цифры, по которым видно, рвётся периодически или
+    # накапливается.
+    ( while :; do
+          pactl list sinks 2>/dev/null \
+              | grep -A 25 "Name: $SINK" \
+              | grep -m1 "Latency:" \
+              | sed "s/^/    [$(date +%H:%M:%S)] /"
+          sleep 0.5
+      done ) > "$TMP/latency.log" 2>/dev/null &
+    SAMPLER=$!
     run_and_report aplay -D "$DEV" -r "$PIPER_RATE" -f S16_LE -t raw -c 1 "$SRC"
+    kill "$SAMPLER" 2>/dev/null
+    wait "$SAMPLER" 2>/dev/null
+
+    echo "    -- задержка синка во время прогона --"
+    # Полный лог не нужен: интересны крайние значения и разброс.
+    awk '{ for (i = 1; i <= NF; i++) if ($i == "Latency:") { v = $(i+1) + 0;
+             if (n++ == 0 || v < lo) lo = v; if (v > hi) hi = v; sum += v } }
+         END { if (n) printf "    минимум %d, максимум %d, среднее %d мкс (%d замеров)\n", lo, hi, sum/n, n;
+               else print "    замеров не набралось" }' "$TMP/latency.log"
+    echo "    (настроено $(pactl list sinks 2>/dev/null | grep -A 25 "Name: $SINK" | grep -m1 -o 'configured [0-9]* usec'))"
 fi
 
 # --- 2. Без пересчёта -----------------------------------------------------
@@ -147,7 +197,7 @@ fi
 # режиме рвётся — дело в старте каждого потока, а не в тракте.
 if announce "Прогон 3 из 4. ДЛИННЫЙ ПОТОК: десять реплик одним запуском."; then
     : > "$TMP/long.raw"
-    ls -S "$VOICE_CACHE_DIR"/*.raw 2>/dev/null | head -10 | while read -r f; do
+    cache_utterances | xargs -r ls -S 2>/dev/null | head -10 | while read -r f; do
         cat "$f" >> "$TMP/long.raw"
     done
     run_and_report aplay -D "$DEV" -r "$PIPER_RATE" -f S16_LE -t raw -c 1 "$TMP/long.raw"
@@ -176,6 +226,13 @@ cat <<'EOF'
                                одним долгоживущим потоком в гарнитуру.
   4 чище 1                  -> виноват alsa-плагин pulse; say.sh переводится
                                на paplay.
-  рвётся везде одинаково    -> тракт ни при чём, это радио. Дальше проверять
-                               wifi (см. TESTING.md, раздел Аудио/Bluetooth).
+  рвётся везде одинаково    -> тракт ни при чём. Дальше два подозреваемых, и
+                               оба проверяются остановкой соседей, а не
+                               настройкой звука:
+                                 systemctl stop blind_nav_main nav_record
+                                 tools/audio_ab_test.sh
+                               чисто без камеры -> общая шина USB либо просто
+                               нагрузка; рвётся и без неё -> радио, идти в
+                               TESTING.md (раздел Аудио/Bluetooth).
+                               Вернуть: systemctl start blind_nav_main nav_record
 EOF
