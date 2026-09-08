@@ -181,6 +181,30 @@ enforce_audio_profile() {
                    state_codec=$rate
                } ;;
     esac
+
+    enforce_volume "$sink"
+}
+
+# Держит громкость синка на BLINDNAV_BT_VOLUME. Нужна отдельно от профиля и
+# кодека: кнопка громкости на этой гарнитуре в HFP не работает (см.
+# BLINDNAV_BT_VOLUME в tools/voice_env.sh) — единственный способ сделать
+# тише доступен только отсюда, программно. Ставится при каждом витке цикла
+# (то есть переживёт и переподключение гарнитуры, и её собственный сброс на
+# Base Volume), но печатает и запоминает состояние только при смене
+# значения — по тому же принципу, что enforce_audio_profile выше.
+enforce_volume() {
+    local sink="$1" current
+    [ -n "$sink" ] || return 0
+
+    current=$(pactl list sinks 2>/dev/null \
+              | awk -v s="$sink" '
+                    index($0, "Name: " s) { f = 1 }
+                    f && /Volume:/ { print $NF; exit }')
+    if [ "$current" != "$BLINDNAV_BT_VOLUME" ]; then
+        if pactl set-sink-volume "$sink" "$BLINDNAV_BT_VOLUME" 2>/dev/null; then
+            echo "[BT Keeper] Громкость: ${current:-?} -> $BLINDNAV_BT_VOLUME"
+        fi
+    fi
 }
 
 start_audio_server() {
