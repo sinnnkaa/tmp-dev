@@ -141,7 +141,7 @@ tune_audio_server() {
 # согласовался как раз CVSD. Молча получить 8 кГц и решить, что HFP «тоже не
 # помог», — самый вероятный способ потерять найденное решение.
 enforce_audio_profile() {
-    local card current sink rate
+    local card current sink sink_name rate
     card=$(pactl list cards short 2>/dev/null \
            | awk -v m="$BLINDNAV_BT_MAC_UND" '$2 ~ m {print $2; exit}')
     [ -n "$card" ] || return 0
@@ -164,6 +164,11 @@ enforce_audio_profile() {
     sink=$(pactl list sinks short 2>/dev/null \
            | awk -F'\t' '$2 ~ /handsfree/ {print $4; exit}')
     rate=${sink%%Hz*}; rate=${rate##* }
+    # $sink выше — это sample spec ("s16le 1ch 16000Hz"), из неё удобно тащить
+    # частоту, но это НЕ имя синка. enforce_volume нужно настоящее имя
+    # (bluez_sink...) — берём отдельным полем той же строки short-листинга.
+    sink_name=$(pactl list sinks short 2>/dev/null \
+                | awk -F'\t' '$2 ~ /handsfree/ {print $2; exit}')
     case "$rate" in
         16000) [ "$state_codec" = "msbc" ] || {
                    echo "[BT Keeper] HFP согласован как mSBC, 16 кГц — это рабочий режим."
@@ -182,7 +187,7 @@ enforce_audio_profile() {
                } ;;
     esac
 
-    enforce_volume "$sink"
+    enforce_volume "$sink_name"
 }
 
 # Держит громкость синка на BLINDNAV_BT_VOLUME. Нужна отдельно от профиля и
